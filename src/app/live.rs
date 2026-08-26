@@ -227,7 +227,7 @@ fn accept_frames(
                     diag.offset,
                     analyzer
                         .redactor
-                        .redact(&diag.sample)
+                        .redact_sample(&diag.sample, analyzer.raw_sample)
                         .trim_end_matches(['\r', '\n']),
                 );
             }
@@ -306,7 +306,8 @@ impl Analyzer {
             eprintln!(
                 "parser diagnostic: {} sample={}",
                 fault.as_str(),
-                self.redactor.redact(metadata.timestamp)
+                self.redactor
+                    .redact_sample(metadata.timestamp, self.raw_sample)
             );
         }
         let key = metadata.grouping_key();
@@ -346,9 +347,9 @@ impl Analyzer {
                 emitted_at: now_utc(),
                 group_id,
                 count: 1,
-                sample: self.redactor.redact_sample(
-                    &frame::bound_sample(event, self.sample_max_bytes),
-                    self.raw_sample,
+                sample: frame::bound_sample(
+                    &self.redactor.redact_sample(event, self.raw_sample),
+                    self.sample_max_bytes,
                 ),
                 timestamp: &timestamp,
                 time_fallback: interpreted.fallback.is_some(),
@@ -432,7 +433,22 @@ mod tests {
     }
 
     fn records(levels: Vec<Level>, lines: &[&str]) -> Vec<serde_json::Value> {
-        let mut analyzer = Analyzer::new(levels);
+        records_with(levels, lines, Redactor::default(), false)
+    }
+
+    fn records_with(
+        levels: Vec<Level>,
+        lines: &[&str],
+        redactor: Redactor,
+        raw_sample: bool,
+    ) -> Vec<serde_json::Value> {
+        let mut analyzer = Analyzer::with_sample_limit(
+            levels,
+            u64::MAX,
+            TimeInterpreter::new(Timezone::Utc),
+            redactor,
+            raw_sample,
+        );
         let mut buf = Vec::new();
         analyzer.emit_session_started(&request(), &mut buf).unwrap();
         for line in lines {
@@ -610,6 +626,106 @@ mod tests {
         assert!(record["terminal_frame"].is_null());
         assert!(record["sample"].as_str().unwrap().len() <= 24);
         assert!(record["source_offsets"]["logger"]["end"].as_u64().unwrap() > 0);
+    }
+
+    #[test]
+    fn grouping_uses_pre_redaction_identity() {
+        let a = "26.08.2026 12:00:00.123 author-0 *ERROR* [FelixDispatchQueue] com.example.Foo user ops@example.com failed";
+        let b = "26.08.2026 12:00:01.000 author-1 *ERROR* [FelixDispatchQueue] com.example.Foo user admin@example.net failed";
+        let recs = records(vec![Level::Error], &[a, b]);
+        let types: Vec<&str> = recs.iter().map(|r| r["type"].as_str().unwrap()).collect();
+        assert_eq!(
+            types,
+            [
+                "session_started",
+                "group_created",
+                "group_created",
+                "source_ended"
+            ]
+        );
+        assert_eq!(recs[1]["group_id"], 1);
+        assert_eq!(recs[2]["group_id"], 2);
+        let sample_a = recs[1]["sample"].as_str().unwrap();
+        let sample_b = recs[2]["sample"].as_str().unwrap();
+        assert!(!sample_a.contains("ops@example.com"), "{sample_a}");
+        assert!(!sample_b.contains("admin@example.net"), "{sample_b}");
+        assert!(sample_a.contains("[REDACTED:email]"), "{sample_a}");
+        assert!(sample_b.contains("[REDACTED:email]"), "{sample_b}");
+        assert_eq!(recs[1]["message"], "user [REDACTED:email] failed");
+        assert_eq!(recs[2]["message"], "user [REDACTED:email] failed");
+    }
+
+    #[test]
+    fn raw_sample_keeps_sample_raw_and_always_redacts_request_context() {
+        let event = concat!(
+            "26.08.2026 12:00:01.456 author-0 *ERROR* ",
+            "[192.0.2.10 [1724666401456] GET /content/site/us/en.html?foo=bar HTTP/1.1] ",
+            "com.example.core.filters.ErrorFilter contact ops@example.com\n",
+            "java.lang.IllegalStateException: resource resolver closed\n",
+            "\tat com.example.core.filters.ErrorFilter.doFilter(ErrorFilter.java:64)\n",
+        );
+        let recs = records_with(vec![Level::Error], &[event], Redactor::default(), true);
+        let sample = recs[1]["sample"].as_str().unwrap();
+        assert_eq!(sample, event);
+        assert!(sample.contains("192.0.2.10"), "{sample}");
+        assert!(sample.contains("ops@example.com"), "{sample}");
+        assert_eq!(recs[1]["request_context"]["client_ip"], "[REDACTED:ip]");
+        assert_eq!(
+            recs[1]["request_context"]["path"],
+            "/content/site/us/en.html?foo=[REDACTED:query]"
+        );
+        assert_eq!(recs[1]["request_context"]["request_id"], "1724666401456");
+        assert!(!recs[1]["thread"].as_str().unwrap().contains("192.0.2.10"));
+        assert_eq!(recs[1]["message"], "contact [REDACTED:email]");
+        assert!(recs[1]["logger"].as_str().unwrap().contains("ErrorFilter"));
+        assert_eq!(
+            recs[1]["terminal_exception"],
+            "java.lang.IllegalStateException"
+        );
+        assert_eq!(
+            recs[1]["terminal_frame"],
+            "com.example.core.filters.ErrorFilter.doFilter"
+        );
+        assert_eq!(recs[1]["timestamp"], "2026-08-26T12:00:01.456Z");
+    }
+
+    #[test]
+    fn extra_patterns_redact_samples_after_builtins() {
+        let event = "26.08.2026 12:00:00.123 author-0 *ERROR* [FelixDispatchQueue] com.example.Foo secret-99 leftover";
+        let recs = records_with(
+            vec![Level::Error],
+            &[event],
+            Redactor::new(vec![regex::Regex::new("secret-[0-9]+").unwrap()]),
+            false,
+        );
+        let sample = recs[1]["sample"].as_str().unwrap();
+        assert!(!sample.contains("secret-99"), "{sample}");
+        assert!(sample.contains("[REDACTED]"), "{sample}");
+        assert!(sample.contains("leftover"), "{sample}");
+        assert!(sample.contains("com.example.Foo"), "{sample}");
+    }
+
+    #[test]
+    fn sample_bound_applies_after_redaction() {
+        let prefix = "26.08.2026 12:00:00.123 author-0 *ERROR* [t] com.example.Foo ";
+        let secret = "ops@example.com";
+        let event = format!("{prefix}{secret} trailing");
+        let max = prefix.len() + 5;
+        let mut analyzer = Analyzer::with_sample_limit(
+            vec![Level::Error],
+            max as u64,
+            TimeInterpreter::new(Timezone::Utc),
+            Redactor::default(),
+            false,
+        );
+        let mut buf = Vec::new();
+        analyzer.ingest(&event, arrival(), &mut buf).unwrap();
+        let record = parse_records(&buf).pop().expect("group record");
+        let sample = record["sample"].as_str().unwrap();
+        assert!(sample.len() <= max, "{sample}");
+        assert!(!sample.contains("ops@"), "{sample}");
+        assert!(!sample.contains(secret), "{sample}");
+        assert!(!sample.contains("example.com"), "{sample}");
     }
 
     #[test]
