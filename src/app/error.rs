@@ -20,7 +20,13 @@ pub(crate) enum Error {
         "stdout is not a terminal. TUI mode requires a TTY; use --json for redirected or piped output."
     )]
     NonTty,
-    /// Reserved for startup failures after CLI validation (exit 1).
+    #[error("failed to start aio: {0}")]
+    Spawn(String),
+    #[error("aio I/O error: {0}")]
+    Io(String),
+    #[error("source ended unexpectedly (aio status {0})")]
+    UnexpectedEnd(String),
+    /// Reserved for other startup failures after CLI validation (exit 1).
     #[allow(dead_code)]
     #[error("{0}")]
     Internal(String),
@@ -29,7 +35,9 @@ pub(crate) enum Error {
 impl Error {
     pub(crate) fn exit_code(&self) -> ExitCode {
         match self {
-            Self::Internal(_) => ExitCode::from(1),
+            Self::Internal(_) | Self::Spawn(_) | Self::Io(_) | Self::UnexpectedEnd(_) => {
+                ExitCode::from(1)
+            }
             _ => ExitCode::from(2),
         }
     }
@@ -49,6 +57,14 @@ mod tests {
         );
         assert_eq!(
             Error::Internal("startup failed".into()).exit_code(),
+            ExitCode::from(1)
+        );
+        assert_eq!(
+            Error::Spawn("not found".into()).exit_code(),
+            ExitCode::from(1)
+        );
+        assert_eq!(
+            Error::UnexpectedEnd("0".into()).exit_code(),
             ExitCode::from(1)
         );
     }

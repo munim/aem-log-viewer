@@ -12,6 +12,7 @@ name = "aemlog"
 path = "src/main.rs"
 
 [dependencies]
+chrono = { version = "0.4.45", default-features = false, features = ["clock", "std"] }
 chrono-tz = "0.10"
 clap = { version = "4.5", features = ["derive", "wrap_help"] }
 crossterm = "0.28"
@@ -20,3 +21,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+uuid = { version = "1", features = ["v4"] }
+
+[dev-dependencies]
+serde_json = "1"
