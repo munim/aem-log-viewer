@@ -3,6 +3,7 @@ mod config;
 mod error;
 mod frame;
 mod live;
+mod rate;
 mod redact;
 mod source;
 mod template;
