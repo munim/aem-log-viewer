@@ -397,8 +397,8 @@ impl Framer {
     }
 }
 
-/// Level and grouping key (`*LEVEL*` through the end of the event, timestamp and
-/// node excluded).
+#[allow(dead_code)]
+/// Level and grouping key retained for the analyzer's legacy parser contract.
 pub(super) fn parse_event(event: &str) -> Option<(Level, &str)> {
     let first = event
         .split_once('\n')
@@ -410,9 +410,277 @@ pub(super) fn parse_event(event: &str) -> Option<(Level, &str)> {
     Some((header.level, event.get(key_offset..)?))
 }
 
+/// Structured fields extracted from one event header. All text fields borrow
+/// the framed event; offsets are byte ranges relative to the event start.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) struct EventMetadata<'a> {
+    pub timestamp: &'a str,
+    pub node: &'a str,
+    pub level: Level,
+    pub thread: &'a str,
+    pub logger: &'a str,
+    pub message: &'a str,
+    pub request_context: Option<RequestContext<'a>>,
+    pub terminal_exception: Option<&'a str>,
+    pub terminal_frame: Option<&'a str>,
+    pub offsets: SourceOffsets,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize)]
+pub(super) struct RequestContext<'a> {
+    pub client_ip: &'a str,
+    pub request_id: &'a str,
+    pub method: &'a str,
+    pub path: &'a str,
+    pub protocol: &'a str,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Serialize)]
+pub(super) struct SourceOffset {
+    pub start: usize,
+    pub end: usize,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Serialize)]
+pub(super) struct SourceOffsets {
+    pub timestamp: SourceOffset,
+    pub node: SourceOffset,
+    pub level: SourceOffset,
+    pub thread: SourceOffset,
+    pub logger: SourceOffset,
+    pub message: SourceOffset,
+}
+
+impl<'a> EventMetadata<'a> {
+    /// Stable grouping identity. Request context and thread scheduling details
+    /// are evidence only and deliberately do not affect grouping.
+    pub(super) fn grouping_key(&self) -> String {
+        format!(
+            "{}\u{1f}{}\u{1f}{}",
+            self.level.as_str(),
+            self.logger,
+            self.message
+        )
+    }
+}
+
+/// Parses structured metadata from a framed event, including terminal identity.
+pub(super) fn parse_metadata(event: &str) -> Option<EventMetadata<'_>> {
+    let line_end = event.find('\n').unwrap_or(event.len());
+    let line = event
+        .get(..line_end)?
+        .strip_suffix('\r')
+        .unwrap_or(&event[..line_end]);
+    let header = parse_header(line)?;
+    let thread = header
+        .context
+        .get(1..header.context.len().checked_sub(1)?)?;
+    let after_context = line.get(header.context_end..)?.strip_prefix(' ')?;
+    let (logger, message) = parse_logger_message(after_context, thread);
+    let base = line.as_ptr() as usize;
+    let relative = |slice: &str| SourceOffset {
+        start: slice.as_ptr() as usize - base,
+        end: slice.as_ptr() as usize - base + slice.len(),
+    };
+    let logger_offset = if logger == "unknown" {
+        SourceOffset { start: 0, end: 0 }
+    } else {
+        relative(logger)
+    };
+    let (terminal_exception, terminal_frame) = parse_terminal_identity(event, message);
+    Some(EventMetadata {
+        timestamp: header.timestamp,
+        node: header.node,
+        level: header.level,
+        thread,
+        logger,
+        message,
+        request_context: parse_request_context(thread),
+        terminal_exception,
+        terminal_frame,
+        offsets: SourceOffsets {
+            timestamp: relative(header.timestamp),
+            node: relative(header.node),
+            level: relative(header.level_token),
+            thread: relative(thread),
+            logger: logger_offset,
+            message: relative(message),
+        },
+    })
+}
+
+/// Last declared exception in event order, plus the first stack frame after it.
+/// `Suppressed` declarations replace prior identity. Frame identity is class.method.
+fn parse_terminal_identity<'a>(
+    event: &'a str,
+    header_message: &'a str,
+) -> (Option<&'a str>, Option<&'a str>) {
+    let mut exception = exception_declaration(header_message);
+    let mut frame = None;
+    let mut want_frame = exception.is_some();
+
+    let body = match event.split_once('\n') {
+        Some((_, rest)) => rest,
+        None => return (exception, frame),
+    };
+    for line in body.lines() {
+        let line = line.strip_suffix('\r').unwrap_or(line);
+        if let Some(class) = exception_declaration(line) {
+            exception = Some(class);
+            frame = None;
+            want_frame = true;
+            continue;
+        }
+        if !want_frame {
+            continue;
+        }
+        if let Some(identity) = stack_frame_identity(line) {
+            frame = Some(identity);
+            want_frame = false;
+        }
+    }
+    (exception, frame)
+}
+
+fn exception_declaration(line: &str) -> Option<&str> {
+    let line = line.trim_start();
+    let line = line
+        .strip_prefix("Caused by: ")
+        .or_else(|| line.strip_prefix("Suppressed: "))
+        .unwrap_or(line);
+    let class = java_type_at_start(line)?;
+    let rest = &line[class.len()..];
+    if rest.is_empty() || rest.starts_with(':') {
+        Some(class)
+    } else {
+        None
+    }
+}
+
+fn java_type_at_start(s: &str) -> Option<&str> {
+    let bytes = s.as_bytes();
+    let mut i = 0;
+    let mut parts = 0;
+    let mut last_start = 0;
+    while i < bytes.len() {
+        if !is_ident_start(bytes[i]) {
+            return None;
+        }
+        last_start = i;
+        i += 1;
+        while i < bytes.len() && is_ident_part(bytes[i]) {
+            i += 1;
+        }
+        parts += 1;
+        if i < bytes.len() && bytes[i] == b'.' {
+            i += 1;
+            if i == bytes.len() {
+                return None;
+            }
+            continue;
+        }
+        break;
+    }
+    if parts < 2 {
+        return None;
+    }
+    if !s[last_start..i]
+        .chars()
+        .next()
+        .is_some_and(|c| c.is_ascii_uppercase())
+    {
+        return None;
+    }
+    Some(&s[..i])
+}
+
+fn is_ident_start(c: u8) -> bool {
+    c.is_ascii_alphabetic() || c == b'_'
+}
+
+fn is_ident_part(c: u8) -> bool {
+    c.is_ascii_alphanumeric() || c == b'_' || c == b'$'
+}
+
+fn stack_frame_identity(line: &str) -> Option<&str> {
+    let rest = line.trim_start().strip_prefix("at ")?;
+    let rest = match rest.split_once('/') {
+        Some((_, after)) => after,
+        None => rest,
+    };
+    let name = rest.split_once('(')?.0;
+    if is_frame_name(name) {
+        Some(name)
+    } else {
+        None
+    }
+}
+
+fn is_frame_name(s: &str) -> bool {
+    let Some((class, method)) = s.rsplit_once('.') else {
+        return false;
+    };
+    if class.is_empty() {
+        return false;
+    }
+    let method_ok = matches!(method, "<init>" | "<clinit>") || is_simple_ident(method);
+    method_ok && class.split('.').all(is_simple_ident)
+}
+
+fn is_simple_ident(s: &str) -> bool {
+    let mut chars = s.bytes();
+    matches!(chars.next(), Some(c) if is_ident_start(c)) && chars.all(is_ident_part)
+}
+
+fn parse_logger_message<'a>(after_context: &'a str, thread: &'a str) -> (&'a str, &'a str) {
+    let mut parts = after_context.splitn(2, char::is_whitespace);
+    let first = parts.next().unwrap_or("");
+    if first.contains('.') && valid_logger(first) {
+        return (first, parts.next().unwrap_or("").trim_start());
+    }
+    if thread.contains('.') && valid_logger(thread) {
+        return (thread, after_context.trim_start());
+    }
+    ("unknown", after_context.trim_start())
+}
+
+fn valid_logger(token: &str) -> bool {
+    !token.is_empty()
+        && token.split('.').all(|part| {
+            !part.is_empty()
+                && part
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '$'))
+        })
+}
+
+fn parse_request_context(thread: &str) -> Option<RequestContext<'_>> {
+    let (client_ip, rest) = thread.split_once(" [")?;
+    let (request_id, request) = rest.split_once("] ")?;
+    let mut fields = request.split_whitespace();
+    let method = fields.next()?;
+    let path = fields.next()?;
+    let protocol = fields.next()?;
+    if fields.next().is_some() || client_ip.is_empty() || request_id.is_empty() {
+        return None;
+    }
+    Some(RequestContext {
+        client_ip,
+        request_id,
+        method,
+        path,
+        protocol,
+    })
+}
+
 struct Header<'a> {
+    timestamp: &'a str,
+    node: &'a str,
     level: Level,
+    level_token: &'a str,
     key: &'a str,
+    context: &'a str,
+    context_end: usize,
 }
 
 fn parse_header(line: &str) -> Option<Header<'_>> {
@@ -426,17 +694,23 @@ fn parse_header(line: &str) -> Option<Header<'_>> {
     }
     let rest = line.get(24..)?;
     let (node, rest) = rest.split_once(' ')?;
-    if node.is_empty() {
-        return None;
-    }
-    if !rest.starts_with('*') {
+    if node.is_empty() || !rest.starts_with('*') {
         return None;
     }
     let (level_token, after_level) = rest[1..].split_once('*')?;
     let level = Level::from_aem(level_token)?;
     let after_level = after_level.strip_prefix(' ')?;
-    let _context = take_balanced_brackets(after_level)?;
-    Some(Header { level, key: rest })
+    let context = take_balanced_brackets(after_level)?;
+    let context_end = line.len() - after_level.len() + context.len();
+    Some(Header {
+        timestamp: ts,
+        node,
+        level,
+        level_token,
+        key: rest,
+        context,
+        context_end,
+    })
 }
 
 fn take_balanced_brackets(s: &str) -> Option<&str> {
@@ -542,7 +816,7 @@ fn truncate_str(s: &str, max: usize) -> &str {
     &s[..end]
 }
 
-fn bound_sample(s: &str, max: usize) -> String {
+pub(super) fn bound_sample(s: &str, max: usize) -> String {
     truncate_str(s, max).to_owned()
 }
 
@@ -1072,5 +1346,199 @@ mod tests {
         assert_eq!(diags[0].reason, DiagnosticReason::UnframedPrefix);
         assert_eq!(diags[0].count, 10_000);
         assert!(diags[0].sample.len() <= 16);
+    }
+    #[test]
+    fn metadata_extracts_standard_header_and_offsets_without_copying_raw() {
+        let event = format!("{ORDINARY}\nstack line\n");
+        let meta = parse_metadata(&event).expect("metadata");
+        assert_eq!(meta.timestamp, "26.08.2026 12:00:00.123");
+        assert_eq!(meta.node, "author-0");
+        assert_eq!(meta.level, Level::Error);
+        assert_eq!(meta.thread, "FelixDispatchQueue");
+        assert_eq!(meta.logger, "com.example.bundle.Activator");
+        assert_eq!(meta.message, "Failed to start bundle com.example.bundle");
+        assert!(meta.request_context.is_none());
+        assert_eq!(
+            &event[meta.offsets.timestamp.start..meta.offsets.timestamp.end],
+            meta.timestamp
+        );
+        assert_eq!(
+            &event[meta.offsets.logger.start..meta.offsets.logger.end],
+            meta.logger
+        );
+        assert_eq!(
+            &event[meta.offsets.message.start..meta.offsets.message.end],
+            meta.message
+        );
+    }
+
+    #[test]
+    fn metadata_extracts_balanced_http_context_and_ignores_it_for_grouping() {
+        let event = format!("{NESTED_HEADER}\n");
+        let meta = parse_metadata(&event).expect("metadata");
+        let request = meta.request_context.as_ref().expect("request context");
+        assert_eq!(request.client_ip, "192.0.2.10");
+        assert_eq!(request.request_id, "1724666401456");
+        assert_eq!(request.method, "GET");
+        assert_eq!(request.path, "/content/site/us/en.html");
+        assert_eq!(request.protocol, "HTTP/1.1");
+        let other = "26.08.2026 12:00:02.000 node *ERROR* [10.0.0.2 [99] GET /other HTTP/1.1] com.example.core.filters.ErrorFilter Uncaught request exception\n";
+        assert_eq!(
+            meta.grouping_key(),
+            parse_metadata(other).unwrap().grouping_key()
+        );
+    }
+
+    #[test]
+    fn metadata_uses_custom_and_unknown_logger_fallbacks() {
+        let custom = "26.08.2026 12:00:00.123 author-0 *ERROR* [com.example.actions.ActionId] Action-ID 42 completed";
+        let custom_meta = parse_metadata(custom).expect("custom metadata");
+        assert_eq!(custom_meta.logger, "com.example.actions.ActionId");
+        assert_eq!(custom_meta.message, "Action-ID 42 completed");
+
+        let unknown = "26.08.2026 12:00:00.123 author-0 *ERROR* [worker-1] Action-ID 42 completed";
+        let unknown_meta = parse_metadata(unknown).expect("unknown metadata");
+        assert_eq!(unknown_meta.logger, "unknown");
+        assert_eq!(unknown_meta.message, "Action-ID 42 completed");
+
+        let malformed = "26.08.2026 12:00:00.123 author-0 *ERROR* [10.0.0.1 [bad] GET /x] com.example.Log message";
+        assert!(parse_metadata(malformed).unwrap().request_context.is_none());
+    }
+
+    fn header(message: &str) -> String {
+        format!(
+            "26.08.2026 12:00:00.123 author-0 *ERROR* [FelixDispatchQueue] com.example.Foo {message}"
+        )
+    }
+
+    fn identity_of(event: &str) -> (Option<&str>, Option<&str>) {
+        let meta = parse_metadata(event).expect("metadata");
+        (meta.terminal_exception, meta.terminal_frame)
+    }
+
+    #[test]
+    fn single_outer_exception_yields_class_and_first_frame() {
+        let event = format!(
+            "{}\njava.lang.RuntimeException: boom\n\tat com.example.Foo.bar(Foo.java:42)\n\tat com.example.Foo.baz(Foo.java:99)\n",
+            header("boom")
+        );
+        assert_eq!(
+            identity_of(&event),
+            (
+                Some("java.lang.RuntimeException"),
+                Some("com.example.Foo.bar")
+            )
+        );
+    }
+
+    #[test]
+    fn last_caused_by_wins_with_its_first_frame() {
+        let event = format!(
+            "{}\njava.lang.RuntimeException: wrap\n\tat com.example.Foo.wrap(Foo.java:10)\nCaused by: java.lang.IllegalStateException: mid\n\tat com.example.Mid.run(Mid.java:7)\nCaused by: javax.jcr.RepositoryException: leaf\n\tat com.example.repo.Opener.open(Opener.java:17)\n\t... 12 more\n",
+            header("wrap")
+        );
+        assert_eq!(
+            identity_of(&event),
+            (
+                Some("javax.jcr.RepositoryException"),
+                Some("com.example.repo.Opener.open")
+            )
+        );
+    }
+
+    #[test]
+    fn later_suppressed_replaces_prior_identity() {
+        let event = format!(
+            "{}\njava.lang.RuntimeException: wrap\n\tat com.example.Foo.wrap(Foo.java:10)\nCaused by: java.lang.IllegalStateException: mid\n\tat com.example.Mid.run(Mid.java:7)\n\tSuppressed: java.io.IOException: temp stream closed\n\t\tat com.example.util.TempStream.close(TempStream.java:28)\n",
+            header("wrap")
+        );
+        assert_eq!(
+            identity_of(&event),
+            (
+                Some("java.io.IOException"),
+                Some("com.example.util.TempStream.close")
+            )
+        );
+    }
+
+    #[test]
+    fn one_line_exception_has_null_frame() {
+        let event = format!(
+            "{}\njavax.jcr.RepositoryException: workspace not found\n",
+            header("failed")
+        );
+        assert_eq!(
+            identity_of(&event),
+            (Some("javax.jcr.RepositoryException"), None)
+        );
+
+        let header_only = header("javax.jcr.RepositoryException: workspace not found");
+        assert_eq!(
+            identity_of(&header_only),
+            (Some("javax.jcr.RepositoryException"), None)
+        );
+    }
+
+    #[test]
+    fn events_without_exception_have_null_identity() {
+        assert_eq!(identity_of(ORDINARY), (None, None));
+        assert_eq!(identity_of(&header("Failed to start bundle")), (None, None));
+    }
+
+    #[test]
+    fn frame_identity_drops_source_location() {
+        let event = format!(
+            "{}\njava.lang.IllegalArgumentException: bad\n\tat com.example.search.QueryParser.parse(QueryParser.java:55)\n",
+            header("bad")
+        );
+        let (_, frame) = identity_of(&event);
+        assert_eq!(frame, Some("com.example.search.QueryParser.parse"));
+        assert!(!frame.unwrap().contains("QueryParser.java"));
+        assert!(!frame.unwrap().contains(':'));
+        assert!(!frame.unwrap().contains('('));
+    }
+
+    #[test]
+    fn exception_like_prose_is_not_identity() {
+        let event = format!(
+            "{}\nFailed because java.lang.NullPointerException was thrown\nCaused by: missing configuration\nSee java.lang.RuntimeException for details\n\tat com.example.Foo.bar(Foo.java:42)\n",
+            header("Failed because java.lang.NullPointerException was thrown")
+        );
+        assert_eq!(identity_of(&event), (None, None));
+    }
+
+    #[test]
+    fn identity_covers_wrappers_suppressed_repeats_and_elision() {
+        let causes = parse_metadata(NESTED_CAUSES).expect("nested causes");
+        assert_eq!(
+            causes.terminal_exception,
+            Some("javax.jcr.RepositoryException")
+        );
+        assert_eq!(
+            causes.terminal_frame,
+            Some("com.example.core.repo.WorkspaceOpener.open")
+        );
+
+        let stack = parse_metadata(LONG_STACK).expect("long stack");
+        assert_eq!(
+            stack.terminal_exception,
+            Some("java.lang.IllegalArgumentException")
+        );
+        assert_eq!(
+            stack.terminal_frame,
+            Some("com.example.core.search.QueryParser.parse")
+        );
+
+        let event = format!(
+            "{}\njava.lang.RuntimeException: boom\n\tat com.example.Foo.bar(Foo.java:42)\n\tat com.example.Foo.bar(Foo.java:42)\n\t... 8 more\n",
+            header("boom")
+        );
+        assert_eq!(
+            identity_of(&event),
+            (
+                Some("java.lang.RuntimeException"),
+                Some("com.example.Foo.bar")
+            )
+        );
     }
 }
