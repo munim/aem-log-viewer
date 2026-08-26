@@ -258,11 +258,11 @@ mod tests {
     fn spaces_and_shell_metacharacters_stay_literal_arguments() {
         let program = "p 1; rm -rf /";
         let environment = "e1 $(uname) && echo pwned | cat";
-        let ims = Some("ctx`id`;echo owned");
-        let args = tail_log_args(&request(program, environment, ims));
+        let ims = "ctx`id`;echo owned";
+        let args = tail_log_args(&request(program, environment, Some(ims)));
         assert_eq!(args[2], environment);
         assert_eq!(args[6], program);
-        assert_eq!(args[8], ims.unwrap());
+        assert_eq!(args[8], ims);
         assert_eq!(args.len(), 9);
         assert!(!args.iter().any(|arg| arg == "-c" || arg == "sh"));
     }

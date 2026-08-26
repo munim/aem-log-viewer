@@ -12,6 +12,7 @@ use uuid::Uuid;
 use super::cli::Timezone;
 use super::cli::{Level, Request};
 use super::frame::{self, Frame, Framer};
+use super::redact::{RedactedRequestContext, Redactor};
 use super::source;
 use super::time::{self, TimeInterpreter};
 use super::Error;
@@ -31,6 +32,8 @@ struct Analyzer {
     next_group_id: u64,
     sample_max_bytes: usize,
     times: TimeInterpreter,
+    redactor: Redactor,
+    raw_sample: bool,
 }
 
 #[derive(Serialize)]
@@ -45,6 +48,7 @@ struct SourceMeta<'a> {
 
 #[derive(Serialize)]
 #[serde(tag = "type")]
+#[allow(clippy::large_enum_variant)]
 enum Record<'a> {
     #[serde(rename = "session_started")]
     SessionStarted {
@@ -65,14 +69,14 @@ enum Record<'a> {
         timestamp: &'a str,
         #[serde(skip_serializing_if = "std::ops::Not::not")]
         time_fallback: bool,
-        node: &'a str,
+        node: String,
         level: &'a str,
-        thread: &'a str,
-        logger: &'a str,
-        message: &'a str,
-        request_context: Option<&'a frame::RequestContext<'a>>,
-        terminal_exception: Option<&'a str>,
-        terminal_frame: Option<&'a str>,
+        thread: String,
+        logger: String,
+        message: String,
+        request_context: Option<RedactedRequestContext>,
+        terminal_exception: Option<String>,
+        terminal_frame: Option<String>,
         source_offsets: frame::SourceOffsets,
     },
     #[serde(rename = "group_updated")]
@@ -147,6 +151,8 @@ pub(super) fn run(request: &Request) -> Result<(), Error> {
         request.levels.clone(),
         request.tuning.sample_max_bytes,
         TimeInterpreter::new(request.timezone),
+        Redactor::new(request.tuning.extra_patterns.clone()),
+        request.raw_sample,
     );
     let mut framer = Framer::with_limits(
         request.tuning.event_max_bytes,
@@ -219,7 +225,10 @@ fn accept_frames(
                     diag.count,
                     diag.line,
                     diag.offset,
-                    diag.sample.trim_end_matches(['\r', '\n']),
+                    analyzer
+                        .redactor
+                        .redact(&diag.sample)
+                        .trim_end_matches(['\r', '\n']),
                 );
             }
         }
@@ -230,13 +239,21 @@ fn accept_frames(
 impl Analyzer {
     #[cfg(test)]
     fn new(levels: Vec<Level>) -> Self {
-        Self::with_sample_limit(levels, u64::MAX, TimeInterpreter::new(Timezone::Utc))
+        Self::with_sample_limit(
+            levels,
+            u64::MAX,
+            TimeInterpreter::new(Timezone::Utc),
+            Redactor::default(),
+            false,
+        )
     }
 
     fn with_sample_limit(
         levels: Vec<Level>,
         sample_max_bytes: u64,
         times: TimeInterpreter,
+        redactor: Redactor,
+        raw_sample: bool,
     ) -> Self {
         Self {
             session_id: Uuid::new_v4().to_string(),
@@ -247,6 +264,8 @@ impl Analyzer {
                 .unwrap_or(usize::MAX)
                 .max(1),
             times,
+            redactor,
+            raw_sample,
         }
     }
 
@@ -287,7 +306,7 @@ impl Analyzer {
             eprintln!(
                 "parser diagnostic: {} sample={}",
                 fault.as_str(),
-                metadata.timestamp
+                self.redactor.redact(metadata.timestamp)
             );
         }
         let key = metadata.grouping_key();
@@ -327,17 +346,27 @@ impl Analyzer {
                 emitted_at: now_utc(),
                 group_id,
                 count: 1,
-                sample: frame::bound_sample(event, self.sample_max_bytes),
+                sample: self.redactor.redact_sample(
+                    &frame::bound_sample(event, self.sample_max_bytes),
+                    self.raw_sample,
+                ),
                 timestamp: &timestamp,
                 time_fallback: interpreted.fallback.is_some(),
-                node: metadata.node,
+                node: self.redactor.redact(metadata.node),
                 level: metadata.level.as_str(),
-                thread: metadata.thread,
-                logger: metadata.logger,
-                message: metadata.message,
-                request_context: metadata.request_context.as_ref(),
-                terminal_exception: metadata.terminal_exception,
-                terminal_frame: metadata.terminal_frame,
+                thread: self.redactor.redact(metadata.thread),
+                logger: self.redactor.redact(metadata.logger),
+                message: self.redactor.redact(metadata.message),
+                request_context: metadata
+                    .request_context
+                    .as_ref()
+                    .map(|ctx| self.redactor.request_context(ctx)),
+                terminal_exception: metadata
+                    .terminal_exception
+                    .map(|value| self.redactor.redact(value)),
+                terminal_frame: metadata
+                    .terminal_frame
+                    .map(|value| self.redactor.redact(value)),
                 source_offsets: metadata.offsets,
             },
         )
@@ -560,6 +589,8 @@ mod tests {
             vec![Level::Error],
             24,
             TimeInterpreter::new(Timezone::Utc),
+            Redactor::default(),
+            false,
         );
         let mut buf = Vec::new();
         analyzer.ingest(event, arrival(), &mut buf).unwrap();
@@ -601,6 +632,8 @@ mod tests {
             vec![Level::Error],
             u64::MAX,
             TimeInterpreter::new(Timezone::Iana("America/New_York".parse().expect("zone"))),
+            Redactor::default(),
+            false,
         );
         let mut buf = Vec::new();
         analyzer.ingest(ERROR_A, arrival(), &mut buf).unwrap();
@@ -615,6 +648,8 @@ mod tests {
             vec![Level::Error],
             u64::MAX,
             TimeInterpreter::new(Timezone::Iana("America/New_York".parse().expect("zone"))),
+            Redactor::default(),
+            false,
         );
         let gap =
             "08.03.2026 02:30:00.000 author-0 *ERROR* [FelixDispatchQueue] com.example.Foo spring";
