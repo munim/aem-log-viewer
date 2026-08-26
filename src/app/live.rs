@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::io::{Read, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
@@ -14,7 +14,7 @@ use super::cli::{Level, Request};
 use super::frame::{self, Frame, Framer};
 use super::redact::{RedactedRequestContext, Redactor};
 use super::source;
-use super::template::TemplateStore;
+use super::template::{BucketKey, TemplateStore};
 use super::time::{self, TimeInterpreter};
 #[cfg(test)]
 use super::tuning::{DEFAULT_BUCKET_CAP, DEFAULT_SIMILARITY};
@@ -23,15 +23,48 @@ use super::Error;
 struct Group {
     id: u64,
     count: u64,
-    /// Monotonic source clock for later rate work. Never moves backward.
-    #[allow(dead_code)]
+    first_seen: DateTime<Utc>,
     latest_effective: DateTime<Utc>,
+    nodes: BTreeSet<String>,
+    sample: String,
+    muted: bool,
+    bucket: BucketKey,
+    index: usize,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct GroupAggregate {
+    id: u64,
+    count: u64,
+    first_seen: DateTime<Utc>,
+    last_seen: DateTime<Utc>,
+    template: Vec<String>,
+    nodes: Vec<String>,
+    sample: String,
+    muted: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum DomainChange {
+    Created {
+        group_id: u64,
+        count: u64,
+    },
+    Updated {
+        group_id: u64,
+        count: u64,
+    },
+    Merged {
+        removed_id: u64,
+        survivor: GroupAggregate,
+    },
 }
 
 struct Analyzer {
     session_id: String,
     levels: Vec<Level>,
     groups: HashMap<String, Group>,
+    removed: HashSet<u64>,
     next_group_id: u64,
     sample_max_bytes: usize,
     times: TimeInterpreter,
@@ -82,6 +115,21 @@ enum Record<'a> {
         terminal_exception: Option<String>,
         terminal_frame: Option<String>,
         source_offsets: frame::SourceOffsets,
+    },
+    #[serde(rename = "group_merged")]
+    GroupMerged {
+        version: u32,
+        session_id: &'a str,
+        emitted_at: String,
+        group_id: u64,
+        removed_id: u64,
+        count: u64,
+        first_seen: String,
+        last_seen: String,
+        template: String,
+        nodes: Vec<String>,
+        muted: bool,
+        sample: String,
     },
     #[serde(rename = "group_updated")]
     GroupUpdated {
@@ -269,6 +317,7 @@ impl Analyzer {
             session_id: Uuid::new_v4().to_string(),
             levels,
             groups: HashMap::new(),
+            removed: HashSet::new(),
             next_group_id: 1,
             sample_max_bytes: usize::try_from(sample_max_bytes)
                 .unwrap_or(usize::MAX)
@@ -331,66 +380,210 @@ impl Analyzer {
         let Some(key) = outcome.group_key() else {
             return Ok(());
         };
-        if let Some(group) = self.groups.get_mut(&key) {
+        let node = self.redactor.redact(metadata.node);
+        let changes = if let Some(group) = self.groups.get_mut(&key) {
             group.count += 1;
+            if interpreted.instant < group.first_seen {
+                group.first_seen = interpreted.instant;
+            }
             group.latest_effective =
                 time::clamp_effective(Some(group.latest_effective), interpreted.instant);
-            let group_id = group.id;
-            let count = group.count;
-            return emit(
+            group.nodes.insert(node);
+            vec![DomainChange::Updated {
+                group_id: group.id,
+                count: group.count,
+            }]
+        } else {
+            let group_id = self.next_group_id;
+            self.next_group_id += 1;
+            let sample = frame::bound_sample(
+                &self.redactor.redact_sample(event, self.raw_sample),
+                self.sample_max_bytes,
+            );
+            let bucket = outcome.bucket().expect("learned bucket").clone();
+            let index = outcome.index().expect("learned index");
+            self.groups.insert(
+                key.clone(),
+                Group {
+                    id: group_id,
+                    count: 1,
+                    first_seen: interpreted.instant,
+                    latest_effective: interpreted.instant,
+                    nodes: BTreeSet::from([node.clone()]),
+                    sample: sample.clone(),
+                    muted: false,
+                    bucket,
+                    index,
+                },
+            );
+            let timestamp = time::rfc3339_millis(interpreted.instant);
+            emit(
                 out,
-                &Record::GroupUpdated {
+                &Record::GroupCreated {
                     version: 1,
                     session_id: &self.session_id,
                     emitted_at: now_utc(),
                     group_id,
-                    count,
+                    count: 1,
+                    sample,
+                    timestamp: &timestamp,
+                    time_fallback: interpreted.fallback.is_some(),
+                    node,
+                    level: metadata.level.as_str(),
+                    thread: self.redactor.redact(metadata.thread),
+                    logger: self.redactor.redact(metadata.logger),
+                    message: self.redactor.redact(metadata.message),
+                    request_context: metadata
+                        .request_context
+                        .as_ref()
+                        .map(|ctx| self.redactor.request_context(ctx)),
+                    terminal_exception: metadata
+                        .terminal_exception
+                        .map(|value| self.redactor.redact(value)),
+                    terminal_frame: metadata
+                        .terminal_frame
+                        .map(|value| self.redactor.redact(value)),
+                    source_offsets: metadata.offsets,
                 },
-            );
+            )?;
+            vec![DomainChange::Created { group_id, count: 1 }]
+        };
+        let mut emitted = changes;
+        emitted.extend(self.apply_merges(&outcome));
+        self.emit_domain_changes(&emitted, out)
+    }
+
+    fn apply_merges(&mut self, outcome: &super::template::LearnOutcome) -> Vec<DomainChange> {
+        let Some(bucket) = outcome.bucket() else {
+            return Vec::new();
+        };
+        let mut changes = Vec::new();
+        for merge in outcome.merges() {
+            let survivor_key = bucket.group_key(merge.survivor);
+            let removed_key = bucket.group_key(merge.removed);
+            let Some(removed) = self.groups.remove(&removed_key) else {
+                continue;
+            };
+            let Some(survivor) = self.groups.remove(&survivor_key) else {
+                self.groups.insert(removed_key, removed);
+                continue;
+            };
+            let (mut keep, drop) = if survivor.id <= removed.id {
+                (survivor, removed)
+            } else {
+                (removed, survivor)
+            };
+            keep.count += drop.count;
+            if drop.first_seen < keep.first_seen {
+                keep.first_seen = drop.first_seen;
+            }
+            keep.latest_effective =
+                time::clamp_effective(Some(keep.latest_effective), drop.latest_effective);
+            keep.nodes.extend(drop.nodes);
+            keep.muted |= drop.muted;
+            keep.bucket = bucket.clone();
+            keep.index = merge.survivor;
+            let removed_id = drop.id;
+            self.removed.insert(removed_id);
+            let aggregate = self.aggregate(&keep);
+            self.groups.insert(survivor_key, keep);
+            changes.push(DomainChange::Merged {
+                removed_id,
+                survivor: aggregate,
+            });
         }
-        let timestamp = time::rfc3339_millis(interpreted.instant);
-        let group_id = self.next_group_id;
-        self.next_group_id += 1;
-        self.groups.insert(
-            key,
-            Group {
-                id: group_id,
-                count: 1,
-                latest_effective: interpreted.instant,
-            },
-        );
-        emit(
-            out,
-            &Record::GroupCreated {
-                version: 1,
-                session_id: &self.session_id,
-                emitted_at: now_utc(),
-                group_id,
-                count: 1,
-                sample: frame::bound_sample(
-                    &self.redactor.redact_sample(event, self.raw_sample),
-                    self.sample_max_bytes,
-                ),
-                timestamp: &timestamp,
-                time_fallback: interpreted.fallback.is_some(),
-                node: self.redactor.redact(metadata.node),
-                level: metadata.level.as_str(),
-                thread: self.redactor.redact(metadata.thread),
-                logger: self.redactor.redact(metadata.logger),
-                message: self.redactor.redact(metadata.message),
-                request_context: metadata
-                    .request_context
-                    .as_ref()
-                    .map(|ctx| self.redactor.request_context(ctx)),
-                terminal_exception: metadata
-                    .terminal_exception
-                    .map(|value| self.redactor.redact(value)),
-                terminal_frame: metadata
-                    .terminal_frame
-                    .map(|value| self.redactor.redact(value)),
-                source_offsets: metadata.offsets,
-            },
-        )
+        changes
+    }
+
+    fn aggregate(&self, group: &Group) -> GroupAggregate {
+        GroupAggregate {
+            id: group.id,
+            count: group.count,
+            first_seen: group.first_seen,
+            last_seen: group.latest_effective,
+            template: self
+                .templates
+                .template(&group.bucket, group.index)
+                .unwrap_or(&[])
+                .to_vec(),
+            nodes: group.nodes.iter().cloned().collect(),
+            sample: group.sample.clone(),
+            muted: group.muted,
+        }
+    }
+
+    fn emit_domain_changes(
+        &self,
+        changes: &[DomainChange],
+        out: &mut impl Write,
+    ) -> Result<(), Error> {
+        let merged = changes
+            .iter()
+            .any(|change| matches!(change, DomainChange::Merged { .. }));
+        for change in changes {
+            match change {
+                DomainChange::Created { .. } => {}
+                DomainChange::Updated { group_id, count } => {
+                    if merged || self.removed.contains(group_id) {
+                        continue;
+                    }
+                    emit(
+                        out,
+                        &Record::GroupUpdated {
+                            version: 1,
+                            session_id: &self.session_id,
+                            emitted_at: now_utc(),
+                            group_id: *group_id,
+                            count: *count,
+                        },
+                    )?;
+                }
+                DomainChange::Merged {
+                    removed_id,
+                    survivor,
+                } => {
+                    emit(
+                        out,
+                        &Record::GroupMerged {
+                            version: 1,
+                            session_id: &self.session_id,
+                            emitted_at: now_utc(),
+                            group_id: survivor.id,
+                            removed_id: *removed_id,
+                            count: survivor.count,
+                            first_seen: time::rfc3339_millis(survivor.first_seen),
+                            last_seen: time::rfc3339_millis(survivor.last_seen),
+                            template: survivor.template.join(" "),
+                            nodes: survivor.nodes.clone(),
+                            muted: survivor.muted,
+                            sample: survivor.sample.clone(),
+                        },
+                    )?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
+    fn snapshot_groups(&self) -> Vec<GroupAggregate> {
+        let mut groups: Vec<GroupAggregate> = self
+            .groups
+            .values()
+            .filter(|group| !self.removed.contains(&group.id))
+            .map(|group| self.aggregate(group))
+            .collect();
+        groups.sort_by_key(|group| group.id);
+        groups
+    }
+
+    #[cfg(test)]
+    fn mute(&mut self, group_id: u64) {
+        for group in self.groups.values_mut() {
+            if group.id == group_id {
+                group.muted = true;
+            }
+        }
     }
 
     fn emit_source_ended(&self, status: Option<i32>, out: &mut impl Write) -> Result<(), Error> {
@@ -849,6 +1042,255 @@ mod tests {
             analyzer.groups.values().next().unwrap().latest_effective,
             first
         );
+    }
+
+    fn event(ts: &str, node: &str, message: &str) -> String {
+        format!("{ts} {node} *ERROR* [FelixDispatchQueue] com.example.Foo {message}")
+    }
+
+    fn stacked(ts: &str, node: &str, message: &str, exception: &str, frame: &str) -> String {
+        format!(
+            "{ts} {node} *ERROR* [FelixDispatchQueue] com.example.Foo {message}\n{exception}: missing\n\tat {frame}(Foo.java:42)\n"
+        )
+    }
+
+    #[test]
+    fn path_and_package_variants_merge_while_frames_stay_split() {
+        let us = event(
+            "26.08.2026 12:00:00.123",
+            "author-0",
+            "Resource not found /content/site/us/en.html",
+        );
+        let de = event(
+            "26.08.2026 12:00:01.000",
+            "author-1",
+            "Resource not found /content/site/de/de.html",
+        );
+        let v1 = event(
+            "26.08.2026 12:00:02.000",
+            "author-0",
+            "Failed to start bundle com.example.core 1.2.3",
+        );
+        let v2 = event(
+            "26.08.2026 12:00:03.000",
+            "author-1",
+            "Failed to start bundle com.example.core 1.2.4",
+        );
+        let framed = stacked(
+            "26.08.2026 12:00:04.000",
+            "author-0",
+            "Resource not found /content/site/fr/fr.html",
+            "java.lang.RuntimeException",
+            "com.example.Foo.bar",
+        );
+        let recs = records(vec![Level::Error], &[&us, &de, &v1, &v2, &framed]);
+        let types: Vec<&str> = recs.iter().map(|r| r["type"].as_str().unwrap()).collect();
+        assert_eq!(
+            types,
+            [
+                "session_started",
+                "group_created",
+                "group_updated",
+                "group_created",
+                "group_updated",
+                "group_created",
+                "source_ended"
+            ]
+        );
+        assert_eq!(recs[1]["group_id"], 1);
+        assert_eq!(recs[2]["group_id"], 1);
+        assert_eq!(recs[3]["group_id"], 2);
+        assert_eq!(recs[4]["group_id"], 2);
+        assert_eq!(recs[5]["group_id"], 3);
+        assert_eq!(recs[5]["terminal_frame"], "com.example.Foo.bar");
+    }
+
+    fn merge_bridge_lines() -> Vec<String> {
+        let first = "alpha beta gamma delta epsilon";
+        let second = "alpha other unique novel epsilon";
+        let mut lines = vec![
+            event("26.08.2026 12:00:00.000", "author-0", first),
+            event("26.08.2026 12:00:01.000", "author-1", second),
+        ];
+        for (src, position, replacement, ts, node) in [
+            (first, 1, "BETA", "26.08.2026 12:00:02.000", "author-0"),
+            (first, 2, "GAMMA", "26.08.2026 12:00:03.000", "author-0"),
+            (second, 1, "OTHER", "26.08.2026 12:00:04.000", "author-1"),
+            (second, 2, "UNIQUE", "26.08.2026 12:00:05.000", "author-2"),
+        ] {
+            let mut tokens: Vec<&str> = src.split_whitespace().collect();
+            tokens[position] = replacement;
+            lines.push(event(ts, node, &tokens.join(" ")));
+        }
+        lines
+    }
+
+    #[test]
+    fn compatible_groups_merge_oldest_id_and_preserve_aggregates() {
+        let lines = merge_bridge_lines();
+        let refs: Vec<&str> = lines.iter().map(String::as_str).collect();
+        let mut analyzer = Analyzer::new(vec![Level::Error]);
+        let mut buf = Vec::new();
+        analyzer.emit_session_started(&request(), &mut buf).unwrap();
+        analyzer.ingest(refs[0], arrival(), &mut buf).unwrap();
+        analyzer.mute(1);
+        for line in &refs[1..] {
+            analyzer.ingest(line, arrival(), &mut buf).unwrap();
+        }
+        analyzer.emit_source_ended(Some(0), &mut buf).unwrap();
+        let recs = parse_records(&buf);
+        let merged = recs
+            .iter()
+            .find(|r| r["type"] == "group_merged")
+            .expect("merge");
+        assert_eq!(merged["group_id"], 1);
+        assert_eq!(merged["removed_id"], 2);
+        assert_eq!(merged["count"], 6);
+        assert_eq!(merged["first_seen"], "2026-08-26T12:00:00.000Z");
+        assert_eq!(merged["last_seen"], "2026-08-26T12:00:05.000Z");
+        assert_eq!(merged["template"], "alpha <*> <*> <*> epsilon");
+        assert_eq!(
+            merged["nodes"],
+            serde_json::json!(["author-0", "author-1", "author-2"])
+        );
+        assert_eq!(merged["muted"], true);
+        assert_eq!(merged["sample"], refs[0]);
+        let snap = analyzer.snapshot_groups();
+        assert_eq!(snap.len(), 1);
+        assert_eq!(snap[0].id, 1);
+        assert_eq!(snap[0].count, 6);
+        assert!(snap[0].muted);
+        assert!(!analyzer.removed.contains(&1));
+        assert!(analyzer.removed.contains(&2));
+    }
+
+    #[test]
+    fn removed_group_ids_do_not_update_or_reappear() {
+        let lines = merge_bridge_lines();
+        let refs: Vec<&str> = lines.iter().map(String::as_str).collect();
+        let mut analyzer = Analyzer::new(vec![Level::Error]);
+        let mut buf = Vec::new();
+        for line in &refs {
+            analyzer.ingest(line, arrival(), &mut buf).unwrap();
+        }
+        let after_merge = event(
+            "26.08.2026 12:00:05.000",
+            "author-3",
+            "alpha other unique novel epsilon",
+        );
+        analyzer.ingest(&after_merge, arrival(), &mut buf).unwrap();
+        let recs = parse_records(&buf);
+        let merge_at = recs
+            .iter()
+            .position(|r| r["type"] == "group_merged")
+            .expect("merge");
+        assert!(recs[merge_at + 1..]
+            .iter()
+            .all(|r| r.get("group_id") != Some(&serde_json::json!(2))));
+        let last = recs.last().unwrap();
+        assert_eq!(last["type"], "group_updated");
+        assert_eq!(last["group_id"], 1);
+        assert_eq!(last["count"], 7);
+        let ids: Vec<u64> = analyzer
+            .snapshot_groups()
+            .into_iter()
+            .map(|g| g.id)
+            .collect();
+        assert_eq!(ids, [1]);
+    }
+
+    fn shuffle<T>(items: &mut [T], seed: u64) {
+        let mut state = seed;
+        for i in (1..items.len()).rev() {
+            state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
+            items.swap(i, (state as usize) % (i + 1));
+        }
+    }
+
+    fn fingerprint(groups: &[GroupAggregate]) -> Vec<(u64, String, Vec<String>, bool)> {
+        let mut rows: Vec<(u64, String, Vec<String>, bool)> = groups
+            .iter()
+            .map(|group| {
+                (
+                    group.count,
+                    group.template.join(" "),
+                    group.nodes.clone(),
+                    group.muted,
+                )
+            })
+            .collect();
+        rows.sort();
+        rows
+    }
+
+    #[test]
+    fn insertion_order_does_not_change_final_groups_or_totals() {
+        let corpus = vec![
+            event(
+                "26.08.2026 12:00:00.000",
+                "author-0",
+                "Resource not found /content/site/us/en.html",
+            ),
+            event(
+                "26.08.2026 12:00:01.000",
+                "author-1",
+                "Resource not found /content/site/de/de.html",
+            ),
+            event(
+                "26.08.2026 12:00:02.000",
+                "author-0",
+                "Failed to start bundle com.example.core 1.2.3",
+            ),
+            event(
+                "26.08.2026 12:00:03.000",
+                "author-1",
+                "Failed to start bundle com.example.core 1.2.4",
+            ),
+            stacked(
+                "26.08.2026 12:00:04.000",
+                "author-0",
+                "Resource not found /content/site/fr/fr.html",
+                "java.lang.RuntimeException",
+                "com.example.Foo.bar",
+            ),
+            stacked(
+                "26.08.2026 12:00:05.000",
+                "author-1",
+                "Resource not found /content/site/es/es.html",
+                "java.lang.RuntimeException",
+                "com.example.Foo.bar",
+            ),
+            stacked(
+                "26.08.2026 12:00:06.000",
+                "author-0",
+                "Resource not found /content/site/it/it.html",
+                "java.lang.IllegalStateException",
+                "com.example.Foo.baz",
+            ),
+        ];
+        let mut analyzer = Analyzer::new(vec![Level::Error]);
+        let mut buf = Vec::new();
+        for line in &corpus {
+            analyzer.ingest(line, arrival(), &mut buf).unwrap();
+        }
+        let expected = fingerprint(&analyzer.snapshot_groups());
+        let expected_total: u64 = analyzer.snapshot_groups().iter().map(|g| g.count).sum();
+        for seed in 1..48 {
+            let mut ordered = corpus.clone();
+            shuffle(&mut ordered, seed);
+            let mut other = Analyzer::new(vec![Level::Error]);
+            let mut out = Vec::new();
+            for line in &ordered {
+                other.ingest(line, arrival(), &mut out).unwrap();
+            }
+            assert_eq!(
+                fingerprint(&other.snapshot_groups()),
+                expected,
+                "seed {seed}"
+            );
+            let total: u64 = other.snapshot_groups().iter().map(|g| g.count).sum();
+            assert_eq!(total, expected_total, "seed {seed}");
+        }
     }
 
     fn is_uuid_v4(id: &str) -> bool {

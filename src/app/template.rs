@@ -32,19 +32,56 @@ impl BucketKey {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) struct TemplateMerge {
+    pub survivor: usize,
+    pub removed: usize,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) enum LearnOutcome {
-    Matched { bucket: BucketKey, index: usize },
-    Created { bucket: BucketKey, index: usize },
-    Capacity { bucket: BucketKey },
+    Matched {
+        bucket: BucketKey,
+        index: usize,
+        merges: Vec<TemplateMerge>,
+    },
+    Created {
+        bucket: BucketKey,
+        index: usize,
+    },
+    Capacity {
+        bucket: BucketKey,
+    },
 }
 
 impl LearnOutcome {
     pub(super) fn group_key(&self) -> Option<String> {
         match self {
             Self::Capacity { .. } => None,
-            Self::Matched { bucket, index } | Self::Created { bucket, index } => {
+            Self::Matched { bucket, index, .. } | Self::Created { bucket, index } => {
                 Some(bucket.group_key(*index))
             }
+        }
+    }
+
+    pub(super) fn merges(&self) -> &[TemplateMerge] {
+        match self {
+            Self::Matched { merges, .. } => merges,
+            Self::Created { .. } | Self::Capacity { .. } => &[],
+        }
+    }
+
+    pub(super) fn index(&self) -> Option<usize> {
+        match self {
+            Self::Matched { index, .. } | Self::Created { index, .. } => Some(*index),
+            Self::Capacity { .. } => None,
+        }
+    }
+
+    pub(super) fn bucket(&self) -> Option<&BucketKey> {
+        match self {
+            Self::Matched { bucket, .. }
+            | Self::Created { bucket, .. }
+            | Self::Capacity { bucket } => Some(bucket),
         }
     }
 }
@@ -53,7 +90,7 @@ impl LearnOutcome {
 pub(super) struct TemplateStore {
     similarity: f64,
     bucket_cap: usize,
-    buckets: HashMap<BucketKey, Vec<Vec<String>>>,
+    buckets: HashMap<BucketKey, Vec<Option<Vec<String>>>>,
 }
 
 impl Default for TemplateStore {
@@ -93,19 +130,23 @@ impl TemplateStore {
     fn learn_tokens(&mut self, bucket: BucketKey, tokens: Vec<String>) -> LearnOutcome {
         if let Some(best) = self.best_candidate(&bucket, &tokens) {
             let templates = self.buckets.get_mut(&bucket).expect("matched bucket");
-            generalize(&mut templates[best], &tokens);
+            let slot = templates[best].as_mut().expect("live matched template");
+            generalize(slot, &tokens);
+            let merges = self.collapse(&bucket);
+            let index = resolve_survivor(best, &merges);
             return LearnOutcome::Matched {
                 bucket,
-                index: best,
+                index,
+                merges,
             };
         }
-        let len = self.buckets.get(&bucket).map_or(0, Vec::len);
-        if len >= self.bucket_cap {
+        let live = self.live_len(&bucket);
+        if live >= self.bucket_cap {
             return LearnOutcome::Capacity { bucket };
         }
         let templates = self.buckets.entry(bucket.clone()).or_default();
         let index = templates.len();
-        templates.push(tokens);
+        templates.push(Some(tokens));
         LearnOutcome::Created { bucket, index }
     }
 
@@ -113,6 +154,9 @@ impl TemplateStore {
         let templates = self.buckets.get(bucket)?;
         let mut best: Option<(usize, f64)> = None;
         for (index, candidate) in templates.iter().enumerate() {
+            let Some(candidate) = candidate else {
+                continue;
+            };
             let score = similarity(candidate, tokens);
             if score < self.similarity {
                 continue;
@@ -125,18 +169,69 @@ impl TemplateStore {
         best.map(|(index, _)| index)
     }
 
-    #[cfg(test)]
-    fn template(&self, bucket: &BucketKey, index: usize) -> Option<&[String]> {
+    fn collapse(&mut self, bucket: &BucketKey) -> Vec<TemplateMerge> {
+        let Some(templates) = self.buckets.get_mut(bucket) else {
+            return Vec::new();
+        };
+        let mut merges = Vec::new();
+        loop {
+            let pair = next_compatible_pair(templates, self.similarity);
+            let Some((survivor, removed)) = pair else {
+                break;
+            };
+            let taken = templates[removed].take().expect("live removed template");
+            generalize(templates[survivor].as_mut().expect("live survivor"), &taken);
+            merges.push(TemplateMerge { survivor, removed });
+        }
+        merges
+    }
+
+    fn live_len(&self, bucket: &BucketKey) -> usize {
+        self.buckets.get(bucket).map_or(0, |templates| {
+            templates.iter().filter(|slot| slot.is_some()).count()
+        })
+    }
+
+    pub(super) fn template(&self, bucket: &BucketKey, index: usize) -> Option<&[String]> {
         self.buckets
             .get(bucket)
             .and_then(|templates| templates.get(index))
+            .and_then(Option::as_ref)
             .map(Vec::as_slice)
     }
 
     #[cfg(test)]
     fn bucket_len(&self, bucket: &BucketKey) -> usize {
-        self.buckets.get(bucket).map_or(0, Vec::len)
+        self.live_len(bucket)
     }
+}
+
+fn next_compatible_pair(
+    templates: &[Option<Vec<String>>],
+    threshold: f64,
+) -> Option<(usize, usize)> {
+    let live: Vec<(usize, &[String])> = templates
+        .iter()
+        .enumerate()
+        .filter_map(|(index, slot)| slot.as_ref().map(|tokens| (index, tokens.as_slice())))
+        .collect();
+    for (offset, &(left, a)) in live.iter().enumerate() {
+        for &(right, b) in live.iter().skip(offset + 1) {
+            if similarity(a, b) >= threshold && similarity(b, a) >= threshold {
+                return Some((left, right));
+            }
+        }
+    }
+    None
+}
+
+fn resolve_survivor(mut index: usize, merges: &[TemplateMerge]) -> usize {
+    for merge in merges {
+        if merge.removed == index {
+            index = merge.survivor;
+        }
+    }
+    index
 }
 
 /// Whitespace tokens with conservative scalar wildcards. Never copies the event.
@@ -440,11 +535,11 @@ mod tests {
         ));
         assert!(matches!(
             learn_msg(&mut store, "a x c d e"),
-            LearnOutcome::Matched { index: 0, .. }
+            LearnOutcome::Matched { index: 0, merges, .. } if merges.is_empty()
         ));
         assert!(matches!(
             learn_msg(&mut store, "a y c d e"),
-            LearnOutcome::Matched { index: 0, .. }
+            LearnOutcome::Matched { index: 0, merges, .. } if merges.is_empty()
         ));
         assert!(matches!(
             learn_msg(&mut store, "a y q d z"),
@@ -496,6 +591,106 @@ mod tests {
             store.template(&bucket, 0).unwrap(),
             ["a", "b", WILDCARD, WILDCARD, WILDCARD]
         );
+    }
+
+    const MERGE_A: &str = "alpha beta gamma delta epsilon";
+    const MERGE_B: &str = "alpha other unique novel epsilon";
+
+    fn replace_token(message: &str, position: usize, replacement: &str) -> String {
+        let mut tokens: Vec<&str> = message.split_whitespace().collect();
+        tokens[position] = replacement;
+        tokens.join(" ")
+    }
+
+    fn learn_replaced(
+        store: &mut TemplateStore,
+        original: &str,
+        position: usize,
+        replacement: &str,
+    ) -> LearnOutcome {
+        learn_msg(store, &replace_token(original, position, replacement))
+    }
+
+    fn drive_bidirectional_merge(store: &mut TemplateStore) -> LearnOutcome {
+        assert!(matches!(
+            learn_msg(store, MERGE_A),
+            LearnOutcome::Created { index: 0, .. }
+        ));
+        assert!(matches!(
+            learn_msg(store, MERGE_B),
+            LearnOutcome::Created { index: 1, .. }
+        ));
+        assert!(learn_replaced(store, MERGE_A, 1, "BETA")
+            .merges()
+            .is_empty());
+        assert!(learn_replaced(store, MERGE_A, 2, "GAMMA")
+            .merges()
+            .is_empty());
+        assert!(learn_replaced(store, MERGE_B, 1, "OTHER")
+            .merges()
+            .is_empty());
+        learn_replaced(store, MERGE_B, 2, "UNIQUE")
+    }
+
+    #[test]
+    fn compatible_templates_merge_oldest_index_and_never_specialize() {
+        let mut store = TemplateStore::default();
+        let merged = drive_bidirectional_merge(&mut store);
+        assert_eq!(index_of(&merged), Some(0));
+        assert_eq!(
+            merged.merges(),
+            [TemplateMerge {
+                survivor: 0,
+                removed: 1
+            }]
+        );
+        assert_eq!(store.bucket_len(bucket(&merged)), 1);
+        assert_eq!(
+            store.template(bucket(&merged), 0).unwrap(),
+            ["alpha", WILDCARD, WILDCARD, WILDCARD, "epsilon"]
+        );
+        assert!(store.template(bucket(&merged), 1).is_none());
+        let again = learn_msg(&mut store, MERGE_B);
+        assert_eq!(index_of(&again), Some(0));
+        assert!(again.merges().is_empty());
+        assert_eq!(
+            store.template(bucket(&again), 0).unwrap(),
+            ["alpha", WILDCARD, WILDCARD, WILDCARD, "epsilon"]
+        );
+    }
+
+    #[test]
+    fn incompatible_fixed_tokens_do_not_merge_or_specialize() {
+        let mut store = TemplateStore::default();
+        learn_msg(&mut store, MERGE_A);
+        learn_msg(&mut store, MERGE_B);
+        let hit = learn_replaced(&mut store, MERGE_A, 1, "BETA");
+        assert_eq!(index_of(&hit), Some(0));
+        assert!(hit.merges().is_empty());
+        assert_eq!(store.bucket_len(bucket(&hit)), 2);
+        assert_eq!(
+            store.template(bucket(&hit), 0).unwrap(),
+            ["alpha", WILDCARD, "gamma", "delta", "epsilon"]
+        );
+        assert_eq!(
+            store.template(bucket(&hit), 1).unwrap(),
+            ["alpha", "other", "unique", "novel", "epsilon"]
+        );
+        let still = learn_replaced(&mut store, MERGE_B, 1, "OTHER");
+        assert!(still.merges().is_empty());
+        assert_eq!(store.bucket_len(bucket(&still)), 2);
+    }
+
+    #[test]
+    fn removed_template_index_stays_dead_and_capacity_counts_live_only() {
+        let mut store = TemplateStore::new(0.60, 2);
+        let merged = drive_bidirectional_merge(&mut store);
+        assert_eq!(store.bucket_len(bucket(&merged)), 1);
+        let fresh = learn_msg(&mut store, "zeta eta theta iota kappa");
+        assert!(matches!(fresh, LearnOutcome::Created { index: 2, .. }));
+        assert_eq!(store.bucket_len(bucket(&fresh)), 2);
+        let overflow = learn_msg(&mut store, "lambda mu nu xi omicron");
+        assert!(matches!(overflow, LearnOutcome::Capacity { .. }));
     }
 
     #[test]
