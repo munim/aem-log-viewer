@@ -1,0 +1,55 @@
+use std::process::ExitCode;
+
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+pub(crate) enum Error {
+    #[error("program ID must be a non-empty string")]
+    EmptyProgramId,
+    #[error("environment ID must be a non-empty string")]
+    EmptyEnvironmentId,
+    #[error("IMS context must be a non-empty string")]
+    EmptyImsContext,
+    #[error("config path must be a non-empty string")]
+    EmptyConfig,
+    #[error("at least one --level is required")]
+    EmptyLevels,
+    #[error("invalid timezone '{0}': expected utc, local, or an IANA timezone name")]
+    InvalidTimezone(String),
+    #[error("--raw-sample requires --json")]
+    RawSampleWithoutJson,
+    #[error(
+        "stdout is not a terminal. TUI mode requires a TTY; use --json for redirected or piped output."
+    )]
+    NonTty,
+    /// Reserved for startup failures after CLI validation (exit 1).
+    #[allow(dead_code)]
+    #[error("{0}")]
+    Internal(String),
+}
+
+impl Error {
+    pub(crate) fn exit_code(&self) -> ExitCode {
+        match self {
+            Self::Internal(_) => ExitCode::from(1),
+            _ => ExitCode::from(2),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn invalid_input_exits_2_and_internal_failures_exit_1() {
+        assert_eq!(Error::NonTty.exit_code(), ExitCode::from(2));
+        assert_eq!(Error::EmptyProgramId.exit_code(), ExitCode::from(2));
+        assert_eq!(
+            Error::InvalidTimezone("x".into()).exit_code(),
+            ExitCode::from(2)
+        );
+        assert_eq!(
+            Error::Internal("startup failed".into()).exit_code(),
+            ExitCode::from(1)
+        );
+    }
+}
