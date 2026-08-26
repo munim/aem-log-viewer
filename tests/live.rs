@@ -548,6 +548,133 @@ java.lang.RuntimeException: boom\n\
 }
 
 #[test]
+fn json_redacts_secrets_and_raw_sample_keeps_sample_bodies() {
+    let fake = FakeAio::install();
+    fs::write(
+        &fake.logs,
+        "\
+26.08.2026 12:00:00.123 n *ERROR* [192.0.2.10 [99] GET /content/site/us/en.html?foo=bar HTTP/1.1] com.example.Foo contact ops@example.com
+java.lang.RuntimeException: boom
+\tat com.example.Foo.bar(Foo.java:42)
+",
+    )
+    .unwrap();
+    let output = run_with_fake(
+        &fake,
+        &[
+            "--program-id",
+            "p1",
+            "--environment-id",
+            "e1",
+            "--service",
+            "author",
+            "--json",
+        ],
+        None,
+    );
+    let recs = json_lines(&output);
+    let created = recs
+        .iter()
+        .find(|r| r["type"] == "group_created")
+        .expect("group_created");
+    let sample = created["sample"].as_str().unwrap();
+    assert!(!sample.contains("ops@example.com"), "{sample}");
+    assert!(!sample.contains("192.0.2.10"), "{sample}");
+    assert!(sample.contains("[REDACTED:email]"), "{sample}");
+    assert!(sample.contains("[REDACTED:ip]"), "{sample}");
+    assert!(sample.contains("/content/site/us/en.html"), "{sample}");
+    assert!(sample.contains("com.example.Foo.bar"), "{sample}");
+    assert_eq!(created["request_context"]["client_ip"], "[REDACTED:ip]");
+    assert_eq!(
+        created["request_context"]["path"],
+        "/content/site/us/en.html?foo=[REDACTED:query]"
+    );
+    assert_eq!(created["terminal_exception"], "java.lang.RuntimeException");
+    assert_eq!(created["terminal_frame"], "com.example.Foo.bar");
+    assert_eq!(created["timestamp"], "2026-08-26T12:00:00.123Z");
+
+    let raw = run_with_fake(
+        &fake,
+        &[
+            "--program-id",
+            "p1",
+            "--environment-id",
+            "e1",
+            "--service",
+            "author",
+            "--json",
+            "--raw-sample",
+        ],
+        None,
+    );
+    let raw_recs = json_lines(&raw);
+    let raw_created = raw_recs
+        .iter()
+        .find(|r| r["type"] == "group_created")
+        .expect("group_created");
+    let raw_sample = raw_created["sample"].as_str().unwrap();
+    assert!(raw_sample.contains("ops@example.com"), "{raw_sample}");
+    assert!(raw_sample.contains("192.0.2.10"), "{raw_sample}");
+    assert_eq!(raw_created["request_context"]["client_ip"], "[REDACTED:ip]");
+    assert_eq!(
+        raw_created["request_context"]["path"],
+        "/content/site/us/en.html?foo=[REDACTED:query]"
+    );
+    assert_eq!(
+        raw_created["terminal_exception"],
+        "java.lang.RuntimeException"
+    );
+    assert_eq!(raw_created["terminal_frame"], "com.example.Foo.bar");
+    assert_eq!(raw_created["timestamp"], "2026-08-26T12:00:00.123Z");
+}
+
+#[test]
+fn parser_diagnostics_redact_unless_raw_sample() {
+    let fake = FakeAio::install();
+    fs::write(
+        &fake.logs,
+        "garbage ops@example.com leftover\n\
+26.08.2026 12:00:00.123 n *ERROR* [t] com.example.Foo boom\n",
+    )
+    .unwrap();
+    let output = run_with_fake(
+        &fake,
+        &[
+            "--program-id",
+            "p1",
+            "--environment-id",
+            "e1",
+            "--service",
+            "author",
+            "--json",
+        ],
+        None,
+    );
+    let err = stderr(&output);
+    assert!(err.contains("parser diagnostic"), "{err}");
+    assert!(!err.contains("ops@example.com"), "{err}");
+    assert!(err.contains("[REDACTED:email]"), "{err}");
+
+    let raw = run_with_fake(
+        &fake,
+        &[
+            "--program-id",
+            "p1",
+            "--environment-id",
+            "e1",
+            "--service",
+            "author",
+            "--json",
+            "--raw-sample",
+        ],
+        None,
+    );
+    let raw_err = stderr(&raw);
+    assert!(raw_err.contains("parser diagnostic"), "{raw_err}");
+    assert!(raw_err.contains("ops@example.com"), "{raw_err}");
+}
+
+#[test]
 fn ctrl_c_terminates_group_and_exits_0() {
     let fake = FakeAio::install();
     let mut child = spawn_held_fake(&fake, false);
@@ -604,8 +731,5 @@ fn ctrl_c_sigkills_term_resistant_descendant() {
     assert!(elapsed >= Duration::from_secs(2), "{elapsed:?}");
     assert!(elapsed < Duration::from_secs(6), "{elapsed:?}");
     assert!(!pid_alive(aio_pid), "aio orphaned after forced kill");
-    assert!(
-        !pid_alive(descendant),
-        "term-resistant descendant orphaned"
-    );
+    assert!(!pid_alive(descendant), "term-resistant descendant orphaned");
 }

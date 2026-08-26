@@ -421,6 +421,8 @@ pub(super) struct EventMetadata<'a> {
     pub logger: &'a str,
     pub message: &'a str,
     pub request_context: Option<RequestContext<'a>>,
+    pub terminal_exception: Option<&'a str>,
+    pub terminal_frame: Option<&'a str>,
     pub offsets: SourceOffsets,
 }
 
@@ -462,7 +464,7 @@ impl<'a> EventMetadata<'a> {
     }
 }
 
-/// Parses structured metadata from the first line of a framed event.
+/// Parses structured metadata from a framed event, including terminal identity.
 pub(super) fn parse_metadata(event: &str) -> Option<EventMetadata<'_>> {
     let line_end = event.find('\n').unwrap_or(event.len());
     let line = event
@@ -485,6 +487,7 @@ pub(super) fn parse_metadata(event: &str) -> Option<EventMetadata<'_>> {
     } else {
         relative(logger)
     };
+    let (terminal_exception, terminal_frame) = parse_terminal_identity(event, message);
     Some(EventMetadata {
         timestamp: header.timestamp,
         node: header.node,
@@ -493,6 +496,8 @@ pub(super) fn parse_metadata(event: &str) -> Option<EventMetadata<'_>> {
         logger,
         message,
         request_context: parse_request_context(thread),
+        terminal_exception,
+        terminal_frame,
         offsets: SourceOffsets {
             timestamp: relative(header.timestamp),
             node: relative(header.node),
@@ -502,6 +507,129 @@ pub(super) fn parse_metadata(event: &str) -> Option<EventMetadata<'_>> {
             message: relative(message),
         },
     })
+}
+
+/// Last declared exception in event order, plus the first stack frame after it.
+/// `Suppressed` declarations replace prior identity. Frame identity is class.method.
+fn parse_terminal_identity<'a>(
+    event: &'a str,
+    header_message: &'a str,
+) -> (Option<&'a str>, Option<&'a str>) {
+    let mut exception = exception_declaration(header_message);
+    let mut frame = None;
+    let mut want_frame = exception.is_some();
+
+    let body = match event.split_once('\n') {
+        Some((_, rest)) => rest,
+        None => return (exception, frame),
+    };
+    for line in body.lines() {
+        let line = line.strip_suffix('\r').unwrap_or(line);
+        if let Some(class) = exception_declaration(line) {
+            exception = Some(class);
+            frame = None;
+            want_frame = true;
+            continue;
+        }
+        if !want_frame {
+            continue;
+        }
+        if let Some(identity) = stack_frame_identity(line) {
+            frame = Some(identity);
+            want_frame = false;
+        }
+    }
+    (exception, frame)
+}
+
+fn exception_declaration(line: &str) -> Option<&str> {
+    let line = line.trim_start();
+    let line = line
+        .strip_prefix("Caused by: ")
+        .or_else(|| line.strip_prefix("Suppressed: "))
+        .unwrap_or(line);
+    let class = java_type_at_start(line)?;
+    let rest = &line[class.len()..];
+    if rest.is_empty() || rest.starts_with(':') {
+        Some(class)
+    } else {
+        None
+    }
+}
+
+fn java_type_at_start(s: &str) -> Option<&str> {
+    let bytes = s.as_bytes();
+    let mut i = 0;
+    let mut parts = 0;
+    let mut last_start = 0;
+    while i < bytes.len() {
+        if !is_ident_start(bytes[i]) {
+            return None;
+        }
+        last_start = i;
+        i += 1;
+        while i < bytes.len() && is_ident_part(bytes[i]) {
+            i += 1;
+        }
+        parts += 1;
+        if i < bytes.len() && bytes[i] == b'.' {
+            i += 1;
+            if i == bytes.len() {
+                return None;
+            }
+            continue;
+        }
+        break;
+    }
+    if parts < 2 {
+        return None;
+    }
+    if !s[last_start..i]
+        .chars()
+        .next()
+        .is_some_and(|c| c.is_ascii_uppercase())
+    {
+        return None;
+    }
+    Some(&s[..i])
+}
+
+fn is_ident_start(c: u8) -> bool {
+    c.is_ascii_alphabetic() || c == b'_'
+}
+
+fn is_ident_part(c: u8) -> bool {
+    c.is_ascii_alphanumeric() || c == b'_' || c == b'$'
+}
+
+fn stack_frame_identity(line: &str) -> Option<&str> {
+    let rest = line.trim_start().strip_prefix("at ")?;
+    let rest = match rest.split_once('/') {
+        Some((_, after)) => after,
+        None => rest,
+    };
+    let name = rest.split_once('(')?.0;
+    if is_frame_name(name) {
+        Some(name)
+    } else {
+        None
+    }
+}
+
+fn is_frame_name(s: &str) -> bool {
+    let Some((class, method)) = s.rsplit_once('.') else {
+        return false;
+    };
+    if class.is_empty() {
+        return false;
+    }
+    let method_ok = matches!(method, "<init>" | "<clinit>") || is_simple_ident(method);
+    method_ok && class.split('.').all(is_simple_ident)
+}
+
+fn is_simple_ident(s: &str) -> bool {
+    let mut chars = s.bytes();
+    matches!(chars.next(), Some(c) if is_ident_start(c)) && chars.all(is_ident_part)
 }
 
 fn parse_logger_message<'a>(after_context: &'a str, thread: &'a str) -> (&'a str, &'a str) {
@@ -1275,5 +1403,142 @@ mod tests {
 
         let malformed = "26.08.2026 12:00:00.123 author-0 *ERROR* [10.0.0.1 [bad] GET /x] com.example.Log message";
         assert!(parse_metadata(malformed).unwrap().request_context.is_none());
+    }
+
+    fn header(message: &str) -> String {
+        format!(
+            "26.08.2026 12:00:00.123 author-0 *ERROR* [FelixDispatchQueue] com.example.Foo {message}"
+        )
+    }
+
+    fn identity_of(event: &str) -> (Option<&str>, Option<&str>) {
+        let meta = parse_metadata(event).expect("metadata");
+        (meta.terminal_exception, meta.terminal_frame)
+    }
+
+    #[test]
+    fn single_outer_exception_yields_class_and_first_frame() {
+        let event = format!(
+            "{}\njava.lang.RuntimeException: boom\n\tat com.example.Foo.bar(Foo.java:42)\n\tat com.example.Foo.baz(Foo.java:99)\n",
+            header("boom")
+        );
+        assert_eq!(
+            identity_of(&event),
+            (
+                Some("java.lang.RuntimeException"),
+                Some("com.example.Foo.bar")
+            )
+        );
+    }
+
+    #[test]
+    fn last_caused_by_wins_with_its_first_frame() {
+        let event = format!(
+            "{}\njava.lang.RuntimeException: wrap\n\tat com.example.Foo.wrap(Foo.java:10)\nCaused by: java.lang.IllegalStateException: mid\n\tat com.example.Mid.run(Mid.java:7)\nCaused by: javax.jcr.RepositoryException: leaf\n\tat com.example.repo.Opener.open(Opener.java:17)\n\t... 12 more\n",
+            header("wrap")
+        );
+        assert_eq!(
+            identity_of(&event),
+            (
+                Some("javax.jcr.RepositoryException"),
+                Some("com.example.repo.Opener.open")
+            )
+        );
+    }
+
+    #[test]
+    fn later_suppressed_replaces_prior_identity() {
+        let event = format!(
+            "{}\njava.lang.RuntimeException: wrap\n\tat com.example.Foo.wrap(Foo.java:10)\nCaused by: java.lang.IllegalStateException: mid\n\tat com.example.Mid.run(Mid.java:7)\n\tSuppressed: java.io.IOException: temp stream closed\n\t\tat com.example.util.TempStream.close(TempStream.java:28)\n",
+            header("wrap")
+        );
+        assert_eq!(
+            identity_of(&event),
+            (
+                Some("java.io.IOException"),
+                Some("com.example.util.TempStream.close")
+            )
+        );
+    }
+
+    #[test]
+    fn one_line_exception_has_null_frame() {
+        let event = format!(
+            "{}\njavax.jcr.RepositoryException: workspace not found\n",
+            header("failed")
+        );
+        assert_eq!(
+            identity_of(&event),
+            (Some("javax.jcr.RepositoryException"), None)
+        );
+
+        let header_only = header("javax.jcr.RepositoryException: workspace not found");
+        assert_eq!(
+            identity_of(&header_only),
+            (Some("javax.jcr.RepositoryException"), None)
+        );
+    }
+
+    #[test]
+    fn events_without_exception_have_null_identity() {
+        assert_eq!(identity_of(ORDINARY), (None, None));
+        assert_eq!(identity_of(&header("Failed to start bundle")), (None, None));
+    }
+
+    #[test]
+    fn frame_identity_drops_source_location() {
+        let event = format!(
+            "{}\njava.lang.IllegalArgumentException: bad\n\tat com.example.search.QueryParser.parse(QueryParser.java:55)\n",
+            header("bad")
+        );
+        let (_, frame) = identity_of(&event);
+        assert_eq!(frame, Some("com.example.search.QueryParser.parse"));
+        assert!(!frame.unwrap().contains("QueryParser.java"));
+        assert!(!frame.unwrap().contains(':'));
+        assert!(!frame.unwrap().contains('('));
+    }
+
+    #[test]
+    fn exception_like_prose_is_not_identity() {
+        let event = format!(
+            "{}\nFailed because java.lang.NullPointerException was thrown\nCaused by: missing configuration\nSee java.lang.RuntimeException for details\n\tat com.example.Foo.bar(Foo.java:42)\n",
+            header("Failed because java.lang.NullPointerException was thrown")
+        );
+        assert_eq!(identity_of(&event), (None, None));
+    }
+
+    #[test]
+    fn identity_covers_wrappers_suppressed_repeats_and_elision() {
+        let causes = parse_metadata(NESTED_CAUSES).expect("nested causes");
+        assert_eq!(
+            causes.terminal_exception,
+            Some("javax.jcr.RepositoryException")
+        );
+        assert_eq!(
+            causes.terminal_frame,
+            Some("com.example.core.repo.WorkspaceOpener.open")
+        );
+
+        let stack = parse_metadata(LONG_STACK).expect("long stack");
+        assert_eq!(
+            stack.terminal_exception,
+            Some("java.lang.IllegalArgumentException")
+        );
+        assert_eq!(
+            stack.terminal_frame,
+            Some("com.example.core.search.QueryParser.parse")
+        );
+
+        let event = format!(
+            "{}\njava.lang.RuntimeException: boom\n\tat com.example.Foo.bar(Foo.java:42)\n\tat com.example.Foo.bar(Foo.java:42)\n\t... 8 more\n",
+            header("boom")
+        );
+        assert_eq!(
+            identity_of(&event),
+            (
+                Some("java.lang.RuntimeException"),
+                Some("com.example.Foo.bar")
+            )
+        );
     }
 }
