@@ -94,6 +94,7 @@ impl Acc {
 }
 
 impl Framer {
+    #[cfg(test)]
     pub(super) fn new() -> Self {
         Self::with_limits(
             DEFAULT_EVENT_BYTES,

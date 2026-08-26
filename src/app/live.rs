@@ -82,7 +82,7 @@ extern "C" fn on_sigint(_: libc::c_int) {
 
 fn install_user_stop_handler() {
     unsafe {
-        libc::signal(libc::SIGINT, on_sigint as libc::sighandler_t);
+        libc::signal(libc::SIGINT, on_sigint as *const () as libc::sighandler_t);
     }
 }
 
