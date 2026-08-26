@@ -11,13 +11,13 @@ use uuid::Uuid;
 #[cfg(test)]
 use super::cli::Timezone;
 use super::cli::{Level, Request};
-#[cfg(test)]
-use super::tuning::{DEFAULT_BUCKET_CAP, DEFAULT_SIMILARITY};
 use super::frame::{self, Frame, Framer};
 use super::redact::{RedactedRequestContext, Redactor};
 use super::source;
 use super::template::TemplateStore;
 use super::time::{self, TimeInterpreter};
+#[cfg(test)]
+use super::tuning::{DEFAULT_BUCKET_CAP, DEFAULT_SIMILARITY};
 use super::Error;
 
 struct Group {

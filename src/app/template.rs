@@ -273,8 +273,9 @@ static TIMESTAMP_RE: LazyLock<Regex> = LazyLock::new(|| {
     .expect("timestamp regex")
 });
 
-static DURATION_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"^\d+(?:\.\d+)?(?:ns|us|µs|μs|ms|s|m|h|d)$").expect("duration regex"));
+static DURATION_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"^\d+(?:\.\d+)?(?:ns|us|µs|μs|ms|s|m|h|d)$").expect("duration regex")
+});
 
 static QUERY_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"([?&][^=&#\s]+=)([^&#\s]*)").expect("query regex"));
@@ -344,10 +345,7 @@ mod tests {
             tokens("obj com.example.Foo@6d06d69c"),
             vec!["obj", "com.example.Foo@<*>"]
         );
-        assert_eq!(
-            tokens("hash deadbeefcafe"),
-            vec!["hash", WILDCARD]
-        );
+        assert_eq!(tokens("hash deadbeefcafe"), vec!["hash", WILDCARD]);
         assert_eq!(tokens("n 1234 ok 42"), vec!["n", WILDCARD, "ok", "42"]);
         assert_eq!(
             tokens("status 200 path /content/site/us/en.html"),
@@ -478,12 +476,7 @@ mod tests {
         let mut store = TemplateStore::default();
         let first = learn_msg(&mut store, "a b c d e");
         let bucket = bucket(&first).clone();
-        let snapshots = [
-            "a b c d x",
-            "a b c y x",
-            "a b z y x",
-            "a b z y x",
-        ];
+        let snapshots = ["a b c d x", "a b c y x", "a b z y x", "a b z y x"];
         let mut wildcards = 0usize;
         for message in snapshots {
             let outcome = learn_msg(&mut store, message);
@@ -535,7 +528,13 @@ mod tests {
         let probe = ceiling.learn(Level::Error, "com.example.Foo", None, None, "ceiling-0");
         assert_eq!(ceiling.bucket_len(bucket(&probe)), MAX_BUCKET_CAP as usize);
         assert!(matches!(
-            ceiling.learn(Level::Error, "com.example.Foo", None, None, "fresh-unmatched"),
+            ceiling.learn(
+                Level::Error,
+                "com.example.Foo",
+                None,
+                None,
+                "fresh-unmatched"
+            ),
             LearnOutcome::Capacity { .. }
         ));
     }
@@ -573,14 +572,8 @@ mod tests {
     #[test]
     fn anonymized_paths_and_package_versions_group() {
         let mut store = TemplateStore::default();
-        let a = learn_msg(
-            &mut store,
-            "Resource not found /content/site/us/en.html",
-        );
-        let b = learn_msg(
-            &mut store,
-            "Resource not found /content/site/de/de.html",
-        );
+        let a = learn_msg(&mut store, "Resource not found /content/site/us/en.html");
+        let b = learn_msg(&mut store, "Resource not found /content/site/de/de.html");
         assert_eq!(index_of(&a), Some(0));
         assert_eq!(index_of(&b), Some(0));
         assert_eq!(
@@ -601,7 +594,14 @@ mod tests {
         assert_eq!(index_of(&v2), Some(0));
         assert_eq!(
             versions.template(bucket(&v1), 0).unwrap(),
-            ["Failed", "to", "start", "bundle", "com.example.core", WILDCARD]
+            [
+                "Failed",
+                "to",
+                "start",
+                "bundle",
+                "com.example.core",
+                WILDCARD
+            ]
         );
     }
 
