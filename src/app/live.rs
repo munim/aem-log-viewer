@@ -23,6 +23,7 @@ struct Analyzer {
     levels: Vec<Level>,
     groups: HashMap<String, Group>,
     next_group_id: u64,
+    sample_max_bytes: usize,
 }
 
 #[derive(Serialize)]
@@ -53,7 +54,15 @@ enum Record<'a> {
         emitted_at: String,
         group_id: u64,
         count: u64,
-        sample: &'a str,
+        sample: String,
+        timestamp: &'a str,
+        node: &'a str,
+        level: &'a str,
+        thread: &'a str,
+        logger: &'a str,
+        message: &'a str,
+        request_context: Option<&'a frame::RequestContext<'a>>,
+        source_offsets: frame::SourceOffsets,
     },
     #[serde(rename = "group_updated")]
     GroupUpdated {
@@ -123,7 +132,8 @@ pub(super) fn run(request: &Request) -> Result<(), Error> {
         }
     });
 
-    let mut analyzer = Analyzer::new(request.levels.clone());
+    let mut analyzer =
+        Analyzer::with_sample_limit(request.levels.clone(), request.tuning.sample_max_bytes);
     let mut framer = Framer::with_limits(
         request.tuning.event_max_bytes,
         request.tuning.event_max_lines,
@@ -204,12 +214,20 @@ fn accept_frames(
 }
 
 impl Analyzer {
+    #[cfg(test)]
     fn new(levels: Vec<Level>) -> Self {
+        Self::with_sample_limit(levels, u64::MAX)
+    }
+
+    fn with_sample_limit(levels: Vec<Level>, sample_max_bytes: u64) -> Self {
         Self {
             session_id: Uuid::new_v4().to_string(),
             levels,
             groups: HashMap::new(),
             next_group_id: 1,
+            sample_max_bytes: usize::try_from(sample_max_bytes)
+                .unwrap_or(usize::MAX)
+                .max(1),
         }
     }
 
@@ -234,13 +252,14 @@ impl Analyzer {
     }
 
     fn ingest(&mut self, event: &str, out: &mut impl Write) -> Result<(), Error> {
-        let Some((level, key)) = frame::parse_event(event) else {
+        let Some(metadata) = frame::parse_metadata(event) else {
             return Ok(());
         };
-        if !self.levels.contains(&level) {
+        if !self.levels.contains(&metadata.level) {
             return Ok(());
         }
-        if let Some(group) = self.groups.get_mut(key) {
+        let key = metadata.grouping_key();
+        if let Some(group) = self.groups.get_mut(&key) {
             group.count += 1;
             let group_id = group.id;
             let count = group.count;
@@ -258,7 +277,7 @@ impl Analyzer {
         let group_id = self.next_group_id;
         self.next_group_id += 1;
         self.groups.insert(
-            key.to_owned(),
+            key,
             Group {
                 id: group_id,
                 count: 1,
@@ -272,7 +291,15 @@ impl Analyzer {
                 emitted_at: now_utc(),
                 group_id,
                 count: 1,
-                sample: event,
+                sample: frame::bound_sample(event, self.sample_max_bytes),
+                timestamp: metadata.timestamp,
+                node: metadata.node,
+                level: metadata.level.as_str(),
+                thread: metadata.thread,
+                logger: metadata.logger,
+                message: metadata.message,
+                request_context: metadata.request_context.as_ref(),
+                source_offsets: metadata.offsets,
             },
         )
     }
@@ -476,6 +503,31 @@ mod tests {
         assert_eq!(recs[1]["sample"], ERROR_A);
         assert_eq!(recs[1]["count"], 1);
         assert_eq!(analyzer.groups.len(), 1);
+    }
+
+    #[test]
+    fn metadata_is_emitted_and_raw_sample_is_bounded() {
+        let event = concat!(
+            "26.08.2026 12:00:00.123 author-0 *ERROR* [worker-1] com.example.Foo ",
+            "message with a deliberately long continuation\n",
+            "stack continuation\n",
+        );
+        let mut analyzer = Analyzer::with_sample_limit(vec![Level::Error], 24);
+        let mut buf = Vec::new();
+        analyzer.ingest(event, &mut buf).unwrap();
+        let record = parse_records(&buf).pop().expect("group record");
+        assert_eq!(record["timestamp"], "26.08.2026 12:00:00.123");
+        assert_eq!(record["node"], "author-0");
+        assert_eq!(record["level"], "ERROR");
+        assert_eq!(record["thread"], "worker-1");
+        assert_eq!(record["logger"], "com.example.Foo");
+        assert_eq!(
+            record["message"],
+            "message with a deliberately long continuation"
+        );
+        assert!(record["request_context"].is_null());
+        assert!(record["sample"].as_str().unwrap().len() <= 24);
+        assert!(record["source_offsets"]["logger"]["end"].as_u64().unwrap() > 0);
     }
 
     fn is_uuid_v4(id: &str) -> bool {
