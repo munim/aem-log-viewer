@@ -1,8 +1,8 @@
 use std::collections::HashMap;
 use std::io::{Read, Write};
-use std::process::Child;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use chrono::{SecondsFormat, Utc};
 use serde::Serialize;
@@ -72,15 +72,28 @@ enum Record<'a> {
     },
 }
 
+static USER_STOP: AtomicBool = AtomicBool::new(false);
+
+const STOP_POLL: Duration = Duration::from_millis(50);
+
+extern "C" fn on_sigint(_: libc::c_int) {
+    USER_STOP.store(true, Ordering::SeqCst);
+}
+
+fn install_user_stop_handler() {
+    unsafe {
+        libc::signal(libc::SIGINT, on_sigint as libc::sighandler_t);
+    }
+}
+
 pub(super) fn run(request: &Request) -> Result<(), Error> {
-    let mut child = spawn(request)?;
-    let stdout = child
-        .stdout
-        .take()
+    install_user_stop_handler();
+    let mut source = source::Source::spawn(request)?;
+    let stdout = source
+        .take_stdout()
         .ok_or_else(|| Error::Io("aio stdout was not piped".into()))?;
-    let stderr = child
-        .stderr
-        .take()
+    let stderr = source
+        .take_stderr()
         .ok_or_else(|| Error::Io("aio stderr was not piped".into()))?;
     let drain = std::thread::spawn(move || {
         let mut stderr = stderr;
@@ -115,8 +128,13 @@ pub(super) fn run(request: &Request) -> Result<(), Error> {
     let mut out = std::io::stdout().lock();
     analyzer.emit_session_started(request, &mut out)?;
 
+    let mut user_stop = false;
     loop {
-        match rx.recv_timeout(frame::IDLE_FLUSH) {
+        if USER_STOP.load(Ordering::SeqCst) {
+            user_stop = true;
+            break;
+        }
+        match rx.recv_timeout(STOP_POLL) {
             Ok(Some(chunk)) => {
                 accept_frames(&mut analyzer, framer.push(&chunk, Instant::now()), &mut out)?;
             }
@@ -134,28 +152,28 @@ pub(super) fn run(request: &Request) -> Result<(), Error> {
         }
     }
 
+    if USER_STOP.load(Ordering::SeqCst) {
+        user_stop = true;
+    }
+
+    // Drain continues on the helper threads while the group is signaled.
+    let status = if user_stop {
+        source.shutdown()?
+    } else {
+        source.wait()?
+    };
     let _ = reader.join();
-    let status = wait_status(&mut child)?;
     let _ = drain.join();
     analyzer.emit_source_ended(status, &mut out)?;
-    Err(Error::UnexpectedEnd(
-        status
-            .map(|code| code.to_string())
-            .unwrap_or_else(|| "signal".into()),
-    ))
-}
-
-fn spawn(request: &Request) -> Result<Child, Error> {
-    source::command(request)
-        .spawn()
-        .map_err(|err| Error::Spawn(err.to_string()))
-}
-
-fn wait_status(child: &mut Child) -> Result<Option<i32>, Error> {
-    child
-        .wait()
-        .map(|status| status.code())
-        .map_err(|err| Error::Io(err.to_string()))
+    if user_stop {
+        Ok(())
+    } else {
+        Err(Error::UnexpectedEnd(
+            status
+                .map(|code| code.to_string())
+                .unwrap_or_else(|| "signal".into()),
+        ))
+    }
 }
 
 fn accept_frames(

@@ -10,6 +10,7 @@ dependencies = [
  "chrono-tz",
  "clap",
  "crossterm",
+ "libc",
  "ratatui",
  "regex",
  "serde",
