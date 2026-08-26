@@ -51,12 +51,15 @@ pub(super) enum LearnOutcome {
     Capacity {
         bucket: BucketKey,
     },
+    Rejected {
+        bucket: BucketKey,
+    },
 }
 
 impl LearnOutcome {
     pub(super) fn group_key(&self) -> Option<String> {
         match self {
-            Self::Capacity { .. } => None,
+            Self::Capacity { .. } | Self::Rejected { .. } => None,
             Self::Matched { bucket, index, .. } | Self::Created { bucket, index } => {
                 Some(bucket.group_key(*index))
             }
@@ -66,14 +69,14 @@ impl LearnOutcome {
     pub(super) fn merges(&self) -> &[TemplateMerge] {
         match self {
             Self::Matched { merges, .. } => merges,
-            Self::Created { .. } | Self::Capacity { .. } => &[],
+            Self::Created { .. } | Self::Capacity { .. } | Self::Rejected { .. } => &[],
         }
     }
 
     pub(super) fn index(&self) -> Option<usize> {
         match self {
             Self::Matched { index, .. } | Self::Created { index, .. } => Some(*index),
-            Self::Capacity { .. } => None,
+            Self::Capacity { .. } | Self::Rejected { .. } => None,
         }
     }
 
@@ -81,7 +84,8 @@ impl LearnOutcome {
         match self {
             Self::Matched { bucket, .. }
             | Self::Created { bucket, .. }
-            | Self::Capacity { bucket } => Some(bucket),
+            | Self::Capacity { bucket }
+            | Self::Rejected { bucket } => Some(bucket),
         }
     }
 }
@@ -108,6 +112,7 @@ impl TemplateStore {
         }
     }
 
+    #[cfg(test)]
     pub(super) fn learn(
         &mut self,
         level: Level,
@@ -115,6 +120,25 @@ impl TemplateStore {
         terminal_exception: Option<&str>,
         terminal_frame: Option<&str>,
         message: &str,
+    ) -> LearnOutcome {
+        self.learn_allowing(
+            level,
+            logger,
+            terminal_exception,
+            terminal_frame,
+            message,
+            true,
+        )
+    }
+
+    pub(super) fn learn_allowing(
+        &mut self,
+        level: Level,
+        logger: &str,
+        terminal_exception: Option<&str>,
+        terminal_frame: Option<&str>,
+        message: &str,
+        allow_create: bool,
     ) -> LearnOutcome {
         let tokens = normalize(message);
         let bucket = BucketKey {
@@ -124,10 +148,15 @@ impl TemplateStore {
             terminal_frame: terminal_frame.map(str::to_owned),
             token_count: tokens.len(),
         };
-        self.learn_tokens(bucket, tokens)
+        self.learn_tokens(bucket, tokens, allow_create)
     }
 
-    fn learn_tokens(&mut self, bucket: BucketKey, tokens: Vec<String>) -> LearnOutcome {
+    fn learn_tokens(
+        &mut self,
+        bucket: BucketKey,
+        tokens: Vec<String>,
+        allow_create: bool,
+    ) -> LearnOutcome {
         if let Some(best) = self.best_candidate(&bucket, &tokens) {
             let templates = self.buckets.get_mut(&bucket).expect("matched bucket");
             let slot = templates[best].as_mut().expect("live matched template");
@@ -143,6 +172,9 @@ impl TemplateStore {
         let live = self.live_len(&bucket);
         if live >= self.bucket_cap {
             return LearnOutcome::Capacity { bucket };
+        }
+        if !allow_create {
+            return LearnOutcome::Rejected { bucket };
         }
         let templates = self.buckets.entry(bucket.clone()).or_default();
         let index = templates.len();
@@ -397,7 +429,8 @@ mod tests {
         match outcome {
             LearnOutcome::Matched { bucket, .. }
             | LearnOutcome::Created { bucket, .. }
-            | LearnOutcome::Capacity { bucket } => bucket,
+            | LearnOutcome::Capacity { bucket }
+            | LearnOutcome::Rejected { bucket } => bucket,
         }
     }
 
@@ -406,7 +439,7 @@ mod tests {
             LearnOutcome::Matched { index, .. } | LearnOutcome::Created { index, .. } => {
                 Some(*index)
             }
-            LearnOutcome::Capacity { .. } => None,
+            LearnOutcome::Capacity { .. } | LearnOutcome::Rejected { .. } => None,
         }
     }
 
@@ -703,6 +736,7 @@ mod tests {
                 LearnOutcome::Created { .. } => created += 1,
                 LearnOutcome::Capacity { .. } => capacity += 1,
                 LearnOutcome::Matched { .. } => panic!("exact similarity should not match"),
+                LearnOutcome::Rejected { .. } => panic!("create was allowed"),
             }
         }
         assert_eq!(created, 5);
