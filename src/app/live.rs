@@ -1,4 +1,4 @@
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{HashMap, HashSet};
 use std::io::{Read, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
@@ -11,6 +11,7 @@ use uuid::Uuid;
 #[cfg(test)]
 use super::cli::Timezone;
 use super::cli::{Level, Request};
+use super::evidence::{self, NodeSet, SampleMeta, SampleStore};
 use super::frame::{self, Frame, Framer};
 use super::rate::{RateParams, RateState};
 #[cfg(test)]
@@ -27,8 +28,8 @@ struct Group {
     count: u64,
     first_seen: DateTime<Utc>,
     latest_effective: DateTime<Utc>,
-    nodes: BTreeSet<String>,
-    sample: String,
+    nodes: NodeSet,
+    sample: SampleMeta,
     muted: bool,
     bucket: BucketKey,
     index: usize,
@@ -43,7 +44,19 @@ pub(super) struct GroupAggregate {
     pub last_seen: DateTime<Utc>,
     pub template: Vec<String>,
     pub nodes: Vec<String>,
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub node_count: u64,
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub nodes_capped: bool,
     pub sample: String,
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub sample_available: bool,
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub sample_truncated: bool,
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub sample_original_bytes: usize,
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub sample_original_lines: usize,
     pub muted: bool,
     pub level: Level,
     pub logger: String,
@@ -69,7 +82,7 @@ struct Overflow {
     count: u64,
     first_seen: DateTime<Utc>,
     latest_effective: DateTime<Utc>,
-    nodes: BTreeSet<String>,
+    nodes: NodeSet,
     global: u64,
     template_bucket: u64,
 }
@@ -162,6 +175,7 @@ struct Analyzer {
     next_group_id: u64,
     max_groups: usize,
     sample_max_bytes: usize,
+    samples: SampleStore,
     times: TimeInterpreter,
     redactor: Redactor,
     raw_sample: bool,
@@ -642,6 +656,11 @@ impl Analyzer {
             sample_max_bytes: usize::try_from(tuning.sample_max_bytes)
                 .unwrap_or(usize::MAX)
                 .max(1),
+            samples: SampleStore::new(
+                usize::try_from(tuning.sample_budget_bytes)
+                    .unwrap_or(usize::MAX)
+                    .max(1),
+            ),
             times,
             redactor,
             raw_sample,
@@ -746,10 +765,12 @@ impl Analyzer {
         } else {
             let group_id = self.next_group_id;
             self.next_group_id += 1;
-            let sample = frame::bound_sample(
+            let captured = evidence::capture(
                 &self.redactor.redact_sample(event, self.raw_sample),
                 self.sample_max_bytes,
             );
+            let sample = captured.text.clone();
+            self.samples.insert(group_id, captured.text);
             let bucket = outcome.bucket().expect("learned bucket").clone();
             let index = outcome.index().expect("learned index");
             self.groups.insert(
@@ -759,8 +780,8 @@ impl Analyzer {
                     count: 1,
                     first_seen: interpreted.instant,
                     latest_effective: interpreted.instant,
-                    nodes: BTreeSet::from([node.clone()]),
-                    sample: sample.clone(),
+                    nodes: NodeSet::singleton(node.clone()),
+                    sample: captured.meta,
                     muted: false,
                     bucket,
                     index,
@@ -839,7 +860,7 @@ impl Analyzer {
                 count: 1,
                 first_seen: instant,
                 latest_effective: instant,
-                nodes: BTreeSet::from([node]),
+                nodes: NodeSet::singleton(node),
                 global,
                 template_bucket,
             },
@@ -873,11 +894,15 @@ impl Analyzer {
             keep.latest_effective =
                 time::clamp_effective(Some(keep.latest_effective), drop.latest_effective);
             keep.rate = keep.rate.merge(drop.rate, &self.rate_params);
-            keep.nodes.extend(drop.nodes);
+            keep.nodes.merge(drop.nodes);
+            if !self.samples.contains(keep.id) && self.samples.contains(drop.id) {
+                keep.sample = drop.sample;
+            }
             keep.muted |= drop.muted;
             keep.bucket = bucket.clone();
             keep.index = merge.survivor;
             let removed_id = drop.id;
+            self.samples.merge(keep.id, removed_id);
             self.removed.insert(removed_id);
             let aggregate = self.aggregate(&keep);
             self.groups.insert(survivor_key, keep);
@@ -900,8 +925,14 @@ impl Analyzer {
                 .template(&group.bucket, group.index)
                 .unwrap_or(&[])
                 .to_vec(),
-            nodes: group.nodes.iter().cloned().collect(),
-            sample: group.sample.clone(),
+            nodes: group.nodes.ids().cloned().collect(),
+            node_count: group.nodes.count(),
+            nodes_capped: group.nodes.capped(),
+            sample: self.samples.get(group.id).unwrap_or("").to_owned(),
+            sample_available: self.samples.contains(group.id),
+            sample_truncated: group.sample.truncated,
+            sample_original_bytes: group.sample.original_bytes,
+            sample_original_lines: group.sample.original_lines,
             muted: group.muted,
             level: group.bucket.level,
             logger: group.bucket.logger.clone(),
@@ -920,8 +951,14 @@ impl Analyzer {
             first_seen: overflow.first_seen,
             last_seen: overflow.latest_effective,
             template: Vec::new(),
-            nodes: overflow.nodes.iter().cloned().collect(),
+            nodes: overflow.nodes.ids().cloned().collect(),
+            node_count: overflow.nodes.count(),
+            nodes_capped: overflow.nodes.capped(),
             sample: String::new(),
+            sample_available: false,
+            sample_truncated: false,
+            sample_original_bytes: 0,
+            sample_original_lines: 0,
             muted: false,
             level: overflow.level,
             logger: String::new(),
@@ -1073,6 +1110,31 @@ impl Analyzer {
                 group.muted = true;
             }
         }
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
+    fn view_detail(&mut self, group_id: u64) -> Option<GroupAggregate> {
+        if self.removed.contains(&group_id) {
+            return None;
+        }
+        if !self.groups.values().any(|group| group.id == group_id) {
+            return None;
+        }
+        self.samples.touch(group_id);
+        self.groups
+            .values()
+            .find(|group| group.id == group_id)
+            .map(|group| self.aggregate(group))
+    }
+
+    #[cfg(test)]
+    fn sample_bytes_used(&self) -> usize {
+        self.samples.used()
+    }
+
+    #[cfg(test)]
+    fn sample_budget(&self) -> usize {
+        self.samples.budget()
     }
 
     fn emit_source_ended(&self, status: Option<i32>, out: &mut impl Write) -> Result<(), Error> {
@@ -2212,6 +2274,198 @@ mod tests {
         assert_eq!(overflow[0].count, 3);
         assert_eq!(overflow[0].capacity_template_bucket, 3);
         assert_eq!(overflow[0].capacity_global, 0);
+    }
+
+    fn analyzer_samples(sample_max_bytes: u64, sample_budget_bytes: u64) -> Analyzer {
+        let tuning = Tuning {
+            sample_max_bytes,
+            sample_budget_bytes,
+            ..Tuning::default()
+        };
+        Analyzer::with_tuning(
+            vec![Level::Error],
+            TimeInterpreter::new(Timezone::Utc),
+            Redactor::default(),
+            false,
+            &tuning,
+        )
+    }
+
+    #[test]
+    fn hot_group_copies_first_sample_once() {
+        let first = stacked(
+            "26.08.2026 12:00:00.000",
+            "author-0",
+            "hot boom",
+            "java.lang.RuntimeException",
+            "com.example.Foo.bar",
+        );
+        let again = stacked(
+            "26.08.2026 12:00:01.000",
+            "author-1",
+            "hot boom",
+            "java.lang.RuntimeException",
+            "com.example.Foo.bar",
+        );
+        let mut analyzer = analyzer_samples(u64::MAX, u64::MAX);
+        let mut buf = Vec::new();
+        analyzer.ingest(&first, arrival(), &mut buf).unwrap();
+        let after_first = analyzer.sample_bytes_used();
+        analyzer.ingest(&again, arrival(), &mut buf).unwrap();
+        analyzer.ingest(&again, arrival(), &mut buf).unwrap();
+        let snap = analyzer.snapshot_groups();
+        assert_eq!(snap.len(), 1);
+        assert_eq!(snap[0].count, 3);
+        assert_eq!(snap[0].sample, first);
+        assert!(snap[0].sample_available);
+        assert!(!snap[0].sample_truncated);
+        assert_eq!(analyzer.sample_bytes_used(), after_first);
+    }
+
+    #[test]
+    fn many_sampled_groups_stay_within_budget() {
+        let mut analyzer = analyzer_samples(32, 512);
+        let lines: Vec<String> = (0..8).map(|i| unique_line("ERROR", i)).collect();
+        ingest_lines(&mut analyzer, &lines);
+        let snap = analyzer.snapshot_groups();
+        assert_eq!(snap.len(), 8);
+        assert!(snap.iter().all(|group| group.sample_available));
+        assert!(analyzer.sample_bytes_used() <= analyzer.sample_budget());
+        assert!(analyzer.sample_bytes_used() > 0);
+    }
+
+    #[test]
+    fn truncated_sample_keeps_head_and_tail() {
+        let mut event = String::from(
+            "26.08.2026 12:00:00.123 author-0 *ERROR* [FelixDispatchQueue] com.example.Foo first message\n",
+        );
+        event.push_str(&"stack-body\n".repeat(40));
+        event.push_str("java.lang.RuntimeException: terminal\n");
+        event.push_str("\tat com.example.Foo.bar(Foo.java:42)\n");
+        let mut analyzer = analyzer_samples(200, 200);
+        let mut buf = Vec::new();
+        analyzer.ingest(&event, arrival(), &mut buf).unwrap();
+        let snap = analyzer.snapshot_groups();
+        assert_eq!(snap.len(), 1);
+        assert!(snap[0].sample_truncated);
+        assert_eq!(snap[0].sample_original_bytes, event.len());
+        assert_eq!(snap[0].sample_original_lines, 43);
+        assert!(
+            snap[0].sample.contains("first message"),
+            "{}",
+            snap[0].sample
+        );
+        assert!(
+            snap[0].sample.contains("Foo.bar(Foo.java:42)"),
+            "{}",
+            snap[0].sample
+        );
+        assert!(snap[0].sample.len() <= 200);
+        assert_eq!(snap[0].count, 1);
+    }
+
+    #[test]
+    fn lru_eviction_drops_sample_not_group_state() {
+        let mut analyzer = analyzer_samples(32, 80);
+        ingest_lines(
+            &mut analyzer,
+            &[
+                unique_line("ERROR", 0),
+                unique_line("ERROR", 1),
+                unique_line("ERROR", 2),
+            ],
+        );
+        let snap = analyzer.snapshot_groups();
+        assert_eq!(snap.len(), 3);
+        assert!(snap.iter().any(|group| !group.sample_available));
+        assert!(snap.iter().all(|group| group.count == 1));
+        assert!(analyzer.sample_bytes_used() <= analyzer.sample_budget());
+        let evicted = snap
+            .iter()
+            .find(|group| !group.sample_available)
+            .expect("evicted");
+        assert!(evicted.sample.is_empty());
+        assert_eq!(evicted.id, 1);
+        assert!(!evicted.muted);
+        assert_eq!(evicted.nodes, ["author-0"]);
+    }
+
+    #[test]
+    fn viewing_detail_refreshes_sample_recency() {
+        let mut analyzer = analyzer_samples(32, 80);
+        ingest_lines(
+            &mut analyzer,
+            &[unique_line("ERROR", 0), unique_line("ERROR", 1)],
+        );
+        let before = analyzer.snapshot_groups();
+        assert!(before.iter().all(|group| group.sample_available));
+        let viewed = analyzer.view_detail(1).expect("group 1");
+        assert_eq!(viewed.count, before[0].count);
+        assert_eq!(viewed.id, 1);
+        ingest_lines(&mut analyzer, &[unique_line("ERROR", 2)]);
+        let snap = analyzer.snapshot_groups();
+        let one = snap.iter().find(|group| group.id == 1).unwrap();
+        let two = snap.iter().find(|group| group.id == 2).unwrap();
+        assert!(one.sample_available);
+        assert!(!two.sample_available);
+        assert_eq!(one.count, 1);
+        assert_eq!(two.count, 1);
+    }
+
+    #[test]
+    fn merge_after_eviction_keeps_oldest_available_sample() {
+        let lines = merge_bridge_lines();
+        let max_len = lines.iter().map(String::len).max().unwrap() as u64;
+        let hold_one = lines[0].len().max(lines[1].len()) as u64;
+        let mut analyzer = analyzer_samples(max_len, hold_one);
+        let mut buf = Vec::new();
+        analyzer.ingest(&lines[0], arrival(), &mut buf).unwrap();
+        analyzer.ingest(&lines[1], arrival(), &mut buf).unwrap();
+        let mid = analyzer.snapshot_groups();
+        assert_eq!(mid.len(), 2);
+        let older = mid.iter().find(|group| group.id == 1).unwrap();
+        let newer = mid.iter().find(|group| group.id == 2).unwrap();
+        assert!(!older.sample_available);
+        assert!(newer.sample_available);
+        for line in &lines[2..] {
+            analyzer.ingest(line, arrival(), &mut buf).unwrap();
+        }
+        let snap = analyzer.snapshot_groups();
+        assert_eq!(snap.len(), 1);
+        assert_eq!(snap[0].id, 1);
+        assert_eq!(snap[0].count, 6);
+        assert!(snap[0].sample_available);
+        assert_eq!(snap[0].sample, lines[1]);
+        assert!(analyzer.sample_bytes_used() <= analyzer.sample_budget());
+    }
+
+    #[test]
+    fn node_ids_stay_exact_through_cap() {
+        let mut analyzer = Analyzer::new(vec![Level::Error]);
+        let mut buf = Vec::new();
+        for i in 0..(evidence::MAX_NODE_IDS + 4) {
+            let line = event(
+                "26.08.2026 12:00:00.000",
+                &format!("author-{i}"),
+                "Failed to start bundle",
+            );
+            analyzer.ingest(&line, arrival(), &mut buf).unwrap();
+        }
+        let snap = analyzer.snapshot_groups();
+        assert_eq!(snap.len(), 1);
+        assert_eq!(snap[0].count, (evidence::MAX_NODE_IDS + 4) as u64);
+        assert_eq!(snap[0].nodes.len(), evidence::MAX_NODE_IDS);
+        assert!(snap[0].nodes_capped);
+        assert_eq!(snap[0].node_count, evidence::MAX_NODE_IDS as u64 + 1);
+        assert!(snap[0].nodes.iter().any(|id| id == "author-0"));
+        assert!(snap[0]
+            .nodes
+            .iter()
+            .any(|id| id == &format!("author-{}", evidence::MAX_NODE_IDS - 1)));
+        assert!(!snap[0]
+            .nodes
+            .iter()
+            .any(|id| id == &format!("author-{}", evidence::MAX_NODE_IDS)));
     }
 
     fn is_uuid_v4(id: &str) -> bool {

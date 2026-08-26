@@ -1,6 +1,7 @@
 mod cli;
 mod config;
 mod error;
+mod evidence;
 mod frame;
 mod live;
 mod rate;
