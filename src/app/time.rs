@@ -31,19 +31,25 @@ pub(super) struct InterpretedTime {
 #[derive(Clone, Copy, Debug)]
 pub(super) struct TimeInterpreter {
     timezone: Timezone,
+    /// Test-only stand-in for the host zone when `timezone` is `Local`.
+    injected_local: Option<chrono_tz::Tz>,
 }
 
 impl TimeInterpreter {
     pub(super) fn new(timezone: Timezone) -> Self {
-        Self { timezone }
+        Self {
+            timezone,
+            injected_local: None,
+        }
     }
 
-    /// Treat `local` as this IANA zone. Tests inject a zone so they do not
-    /// depend on the host timezone.
+    /// Run the `local` mapper with this IANA zone so tests do not depend on
+    /// the host timezone.
     #[cfg(test)]
     pub(super) fn with_local_zone(tz: chrono_tz::Tz) -> Self {
         Self {
-            timezone: Timezone::Iana(tz),
+            timezone: Timezone::Local,
+            injected_local: Some(tz),
         }
     }
 
@@ -51,7 +57,7 @@ impl TimeInterpreter {
         let Some(naive) = NaiveDateTime::parse_from_str(wall, AEM_WALL).ok() else {
             return InterpretedTime {
                 instant: arrival,
-                fallback: None,
+                fallback: Some(TimeFault::Nonexistent),
             };
         };
         match self.map_wall(naive) {
@@ -73,9 +79,14 @@ impl TimeInterpreter {
     fn map_wall(self, naive: NaiveDateTime) -> chrono::LocalResult<DateTime<Utc>> {
         match self.timezone {
             Timezone::Utc => chrono::LocalResult::Single(naive.and_utc()),
-            Timezone::Local => chrono::Local
-                .from_local_datetime(&naive)
-                .map(|dt| dt.with_timezone(&Utc)),
+            Timezone::Local => match self.injected_local {
+                Some(tz) => tz
+                    .from_local_datetime(&naive)
+                    .map(|dt| dt.with_timezone(&Utc)),
+                None => chrono::Local
+                    .from_local_datetime(&naive)
+                    .map(|dt| dt.with_timezone(&Utc)),
+            },
             Timezone::Iana(tz) => tz
                 .from_local_datetime(&naive)
                 .map(|dt| dt.with_timezone(&Utc)),
@@ -192,6 +203,17 @@ mod tests {
         let named = TimeInterpreter::new(Timezone::Iana(ny)).interpret(wall, arrival());
         assert_eq!(injected, named);
         assert_eq!(rfc3339_millis(injected.instant), "2026-08-26T16:00:00.000Z");
+        assert_eq!(
+            TimeInterpreter::with_local_zone(ny).timezone,
+            Timezone::Local
+        );
+    }
+
+    #[test]
+    fn impossible_civil_date_uses_arrival_fallback() {
+        let got = interpret(Timezone::Utc, "31.02.2026 12:00:00.000");
+        assert_eq!(got.fallback, Some(TimeFault::Nonexistent));
+        assert_eq!(got.instant, arrival());
     }
 
     #[test]
