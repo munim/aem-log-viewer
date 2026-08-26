@@ -50,7 +50,9 @@ mod tests {
             "author",
             "--json",
         ]);
-        execute(raw, SearchRoots::default()).expect("accepted json invocation");
+        let input = cli::CliInput::try_from(raw).expect("accepted json invocation");
+        let request = config::resolve(input, None).expect("resolved json invocation");
+        assert!(request.json);
     }
 
     #[test]

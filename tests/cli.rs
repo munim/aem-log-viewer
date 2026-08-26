@@ -269,7 +269,7 @@ fn invalid_explicit_config_exits_2() {
 }
 
 #[test]
-fn valid_explicit_config_exits_0() {
+fn valid_explicit_config_is_accepted_before_aio_start() {
     let isolate = Isolate::new();
     let config = isolate.cwd.join("ok.toml");
     fs::write(&config, "timezone = \"utc\"\n").expect("ok config");
@@ -284,5 +284,6 @@ fn valid_explicit_config_exits_0() {
         config.to_str().expect("utf8 path"),
         "--json",
     ]);
-    assert_eq!(output.status.code(), Some(0), "stderr={}", stderr(&output));
+    assert_eq!(output.status.code(), Some(1), "stderr={}", stderr(&output));
+    assert!(stderr(&output).contains("aio"), "{}", stderr(&output));
 }

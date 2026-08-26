@@ -50,6 +50,7 @@ mod tests {
             timezone: Timezone::Utc,
             json: true,
             raw_sample: false,
+            loaded: None,
         }
     }
 
