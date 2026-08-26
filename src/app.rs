@@ -3,6 +3,7 @@ mod config;
 mod error;
 mod frame;
 mod live;
+mod redact;
 mod source;
 mod time;
 mod tuning;

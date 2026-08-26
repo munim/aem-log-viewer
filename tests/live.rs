@@ -548,6 +548,78 @@ java.lang.RuntimeException: boom\n\
 }
 
 #[test]
+fn json_redacts_secrets_and_raw_sample_keeps_sample_bodies() {
+    let fake = FakeAio::install();
+    fs::write(
+        &fake.logs,
+        "\
+26.08.2026 12:00:00.123 n *ERROR* [192.0.2.10 [99] GET /content/site/us/en.html?foo=bar HTTP/1.1] com.example.Foo contact ops@example.com
+java.lang.RuntimeException: boom
+\tat com.example.Foo.bar(Foo.java:42)
+",
+    )
+    .unwrap();
+    let output = run_with_fake(
+        &fake,
+        &[
+            "--program-id",
+            "p1",
+            "--environment-id",
+            "e1",
+            "--service",
+            "author",
+            "--json",
+        ],
+        None,
+    );
+    let recs = json_lines(&output);
+    let created = recs
+        .iter()
+        .find(|r| r["type"] == "group_created")
+        .expect("group_created");
+    let sample = created["sample"].as_str().unwrap();
+    assert!(!sample.contains("ops@example.com"), "{sample}");
+    assert!(!sample.contains("192.0.2.10"), "{sample}");
+    assert!(sample.contains("[REDACTED:email]"), "{sample}");
+    assert!(sample.contains("[REDACTED:ip]"), "{sample}");
+    assert!(sample.contains("/content/site/us/en.html"), "{sample}");
+    assert!(sample.contains("com.example.Foo.bar"), "{sample}");
+    assert_eq!(created["request_context"]["client_ip"], "[REDACTED:ip]");
+    assert_eq!(
+        created["request_context"]["path"],
+        "/content/site/us/en.html?foo=[REDACTED:query]"
+    );
+
+    let raw = run_with_fake(
+        &fake,
+        &[
+            "--program-id",
+            "p1",
+            "--environment-id",
+            "e1",
+            "--service",
+            "author",
+            "--json",
+            "--raw-sample",
+        ],
+        None,
+    );
+    let raw_recs = json_lines(&raw);
+    let raw_created = raw_recs
+        .iter()
+        .find(|r| r["type"] == "group_created")
+        .expect("group_created");
+    let raw_sample = raw_created["sample"].as_str().unwrap();
+    assert!(raw_sample.contains("ops@example.com"), "{raw_sample}");
+    assert!(raw_sample.contains("192.0.2.10"), "{raw_sample}");
+    assert_eq!(raw_created["request_context"]["client_ip"], "[REDACTED:ip]");
+    assert_eq!(
+        raw_created["request_context"]["path"],
+        "/content/site/us/en.html?foo=[REDACTED:query]"
+    );
+}
+
+#[test]
 fn ctrl_c_terminates_group_and_exits_0() {
     let fake = FakeAio::install();
     let mut child = spawn_held_fake(&fake, false);
@@ -604,8 +676,5 @@ fn ctrl_c_sigkills_term_resistant_descendant() {
     assert!(elapsed >= Duration::from_secs(2), "{elapsed:?}");
     assert!(elapsed < Duration::from_secs(6), "{elapsed:?}");
     assert!(!pid_alive(aio_pid), "aio orphaned after forced kill");
-    assert!(
-        !pid_alive(descendant),
-        "term-resistant descendant orphaned"
-    );
+    assert!(!pid_alive(descendant), "term-resistant descendant orphaned");
 }
