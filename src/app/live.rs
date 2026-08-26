@@ -12,6 +12,9 @@ use uuid::Uuid;
 use super::cli::Timezone;
 use super::cli::{Level, Request};
 use super::frame::{self, Frame, Framer};
+use super::rate::{RateParams, RateState};
+#[cfg(test)]
+use super::rate::{RateSnapshot, View};
 use super::redact::{RedactedRequestContext, Redactor};
 use super::source;
 use super::template::{BucketKey, TemplateStore};
@@ -30,6 +33,7 @@ struct Group {
     muted: bool,
     bucket: BucketKey,
     index: usize,
+    rate: RateState,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -71,6 +75,7 @@ struct Analyzer {
     redactor: Redactor,
     raw_sample: bool,
     templates: TemplateStore,
+    rate_params: RateParams,
 }
 
 #[derive(Serialize)]
@@ -207,7 +212,8 @@ pub(super) fn run(request: &Request) -> Result<(), Error> {
         request.raw_sample,
         request.tuning.similarity,
         request.tuning.bucket_cap,
-    );
+    )
+    .with_rate_params(RateParams::from_tuning(&request.tuning));
     let mut framer = Framer::with_limits(
         request.tuning.event_max_bytes,
         request.tuning.event_max_lines,
@@ -326,7 +332,13 @@ impl Analyzer {
             redactor,
             raw_sample,
             templates: TemplateStore::new(similarity, bucket_cap),
+            rate_params: RateParams::default(),
         }
+    }
+
+    fn with_rate_params(mut self, rate_params: RateParams) -> Self {
+        self.rate_params = rate_params;
+        self
     }
 
     fn emit_session_started(&self, request: &Request, out: &mut impl Write) -> Result<(), Error> {
@@ -388,6 +400,9 @@ impl Analyzer {
             }
             group.latest_effective =
                 time::clamp_effective(Some(group.latest_effective), interpreted.instant);
+            group
+                .rate
+                .observe(group.latest_effective, &self.rate_params);
             group.nodes.insert(node);
             vec![DomainChange::Updated {
                 group_id: group.id,
@@ -414,6 +429,7 @@ impl Analyzer {
                     muted: false,
                     bucket,
                     index,
+                    rate: RateState::first(interpreted.instant, &self.rate_params),
                 },
             );
             let timestamp = time::rfc3339_millis(interpreted.instant);
@@ -479,6 +495,7 @@ impl Analyzer {
             }
             keep.latest_effective =
                 time::clamp_effective(Some(keep.latest_effective), drop.latest_effective);
+            keep.rate = keep.rate.merge(drop.rate, &self.rate_params);
             keep.nodes.extend(drop.nodes);
             keep.muted |= drop.muted;
             keep.bucket = bucket.clone();
@@ -575,6 +592,31 @@ impl Analyzer {
             .collect();
         groups.sort_by_key(|group| group.id);
         groups
+    }
+
+    #[cfg(test)]
+    fn rate_snapshots(&self, now: DateTime<Utc>) -> Vec<RateSnapshot> {
+        self.groups
+            .values()
+            .filter(|group| !self.removed.contains(&group.id))
+            .map(|group| {
+                let (fast, baseline) = group.rate.rates_at(now, &self.rate_params);
+                RateSnapshot {
+                    id: group.id,
+                    count: group.count,
+                    first_seen: group.first_seen,
+                    last_seen: group.latest_effective,
+                    muted: group.muted,
+                    fast,
+                    baseline,
+                }
+            })
+            .collect()
+    }
+
+    #[cfg(test)]
+    fn ranked(&self, view: View, now: DateTime<Utc>) -> Vec<RateSnapshot> {
+        super::rate::rank(view, &self.rate_snapshots(now), now, &self.rate_params)
     }
 
     #[cfg(test)]
@@ -1291,6 +1333,172 @@ mod tests {
             let total: u64 = other.snapshot_groups().iter().map(|g| g.count).sum();
             assert_eq!(total, expected_total, "seed {seed}");
         }
+    }
+
+    #[test]
+    fn rates_leave_counts_and_timestamps_exact() {
+        let mut analyzer = Analyzer::new(vec![Level::Error]);
+        let mut buf = Vec::new();
+        analyzer
+            .ingest(
+                &event(
+                    "26.08.2026 12:00:00.000",
+                    "author-0",
+                    "Failed to start bundle",
+                ),
+                arrival(),
+                &mut buf,
+            )
+            .unwrap();
+        analyzer
+            .ingest(
+                &event(
+                    "26.08.2026 12:00:10.000",
+                    "author-1",
+                    "Failed to start bundle",
+                ),
+                arrival(),
+                &mut buf,
+            )
+            .unwrap();
+        let snap = analyzer.snapshot_groups();
+        assert_eq!(snap.len(), 1);
+        assert_eq!(snap[0].count, 2);
+        assert_eq!(
+            snap[0].first_seen,
+            Utc.with_ymd_and_hms(2026, 8, 26, 12, 0, 0).unwrap()
+        );
+        assert_eq!(
+            snap[0].last_seen,
+            Utc.with_ymd_and_hms(2026, 8, 26, 12, 0, 10).unwrap()
+        );
+        let now = Utc.with_ymd_and_hms(2026, 8, 26, 12, 0, 10).unwrap();
+        let rates = analyzer.rate_snapshots(now);
+        assert_eq!(rates[0].count, 2);
+        assert_eq!(rates[0].first_seen, snap[0].first_seen);
+        assert_eq!(rates[0].last_seen, snap[0].last_seen);
+        assert!(rates[0].fast > 0.0);
+    }
+
+    #[test]
+    fn fallback_arrival_time_feeds_rate_clock() {
+        let mut analyzer = Analyzer::with_sample_limit(
+            vec![Level::Error],
+            u64::MAX,
+            TimeInterpreter::new(Timezone::Iana("America/New_York".parse().expect("zone"))),
+            Redactor::default(),
+            false,
+            DEFAULT_SIMILARITY,
+            DEFAULT_BUCKET_CAP,
+        );
+        let gap =
+            "08.03.2026 02:30:00.000 author-0 *ERROR* [FelixDispatchQueue] com.example.Foo spring";
+        let mut buf = Vec::new();
+        analyzer.ingest(gap, arrival(), &mut buf).unwrap();
+        let group = analyzer.groups.values().next().unwrap();
+        assert_eq!(group.latest_effective, arrival());
+        assert_eq!(group.rate.updated_at(), arrival());
+    }
+
+    #[test]
+    fn out_of_order_nodes_do_not_regress_rate_clock() {
+        let mut analyzer = Analyzer::new(vec![Level::Error]);
+        let later = event(
+            "26.08.2026 12:00:10.000",
+            "author-0",
+            "Failed to start bundle",
+        );
+        let earlier = event(
+            "26.08.2026 12:00:01.000",
+            "author-1",
+            "Failed to start bundle",
+        );
+        let mut buf = Vec::new();
+        analyzer.ingest(&later, arrival(), &mut buf).unwrap();
+        analyzer.ingest(&earlier, arrival(), &mut buf).unwrap();
+        let group = analyzer.groups.values().next().unwrap();
+        let last = Utc.with_ymd_and_hms(2026, 8, 26, 12, 0, 10).unwrap();
+        assert_eq!(group.latest_effective, last);
+        assert_eq!(group.rate.updated_at(), last);
+        assert_eq!(group.count, 2);
+        assert_eq!(
+            group.first_seen,
+            Utc.with_ymd_and_hms(2026, 8, 26, 12, 0, 1).unwrap()
+        );
+    }
+
+    #[test]
+    fn merge_combines_rate_state_without_changing_exact_counts() {
+        let lines = merge_bridge_lines();
+        let mut analyzer = Analyzer::new(vec![Level::Error]);
+        let mut buf = Vec::new();
+        for line in &lines {
+            analyzer.ingest(line, arrival(), &mut buf).unwrap();
+        }
+        let snap = analyzer.snapshot_groups();
+        assert_eq!(snap.len(), 1);
+        assert_eq!(snap[0].count, 6);
+        assert_eq!(
+            snap[0].first_seen,
+            Utc.with_ymd_and_hms(2026, 8, 26, 12, 0, 0).unwrap()
+        );
+        assert_eq!(
+            snap[0].last_seen,
+            Utc.with_ymd_and_hms(2026, 8, 26, 12, 0, 5).unwrap()
+        );
+        let now = snap[0].last_seen;
+        let rates = analyzer.rate_snapshots(now);
+        assert_eq!(rates[0].count, 6);
+        assert!(rates[0].fast > 0.0);
+        assert_eq!(
+            analyzer.groups.values().next().unwrap().rate.updated_at(),
+            now
+        );
+    }
+
+    #[test]
+    fn ranked_views_use_snapshot_clock() {
+        let mut analyzer = Analyzer::new(vec![Level::Error]);
+        let mut buf = Vec::new();
+        analyzer
+            .ingest(
+                &event("26.08.2026 12:00:00.000", "author-0", "alpha error"),
+                arrival(),
+                &mut buf,
+            )
+            .unwrap();
+        analyzer
+            .ingest(
+                &event("26.08.2026 12:00:50.000", "author-0", "beta error"),
+                arrival(),
+                &mut buf,
+            )
+            .unwrap();
+        analyzer.mute(1);
+        let now = Utc.with_ymd_and_hms(2026, 8, 26, 12, 0, 50).unwrap();
+        assert_eq!(
+            analyzer
+                .ranked(View::New, now)
+                .iter()
+                .map(|g| g.id)
+                .collect::<Vec<_>>(),
+            [2, 1]
+        );
+        assert!(analyzer
+            .ranked(
+                View::Increasing,
+                Utc.with_ymd_and_hms(2026, 8, 26, 12, 0, 50).unwrap()
+            )
+            .is_empty());
+        assert_eq!(analyzer.ranked(View::Muted, now)[0].id, 1);
+        assert_eq!(
+            analyzer
+                .ranked(View::Volume, now)
+                .iter()
+                .map(|g| g.id)
+                .collect::<Vec<_>>(),
+            [1, 2]
+        );
     }
 
     fn is_uuid_v4(id: &str) -> bool {
