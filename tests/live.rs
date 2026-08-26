@@ -1,9 +1,9 @@
 use std::fs;
-use std::io::Write;
+use std::io::{Read, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use std::process::{Command, Output, Stdio};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const FAKE_AIO: &str = r#"#!/bin/sh
 if [ -n "${AEMLOG_FAKE_AIO_RECORD-}" ]; then
@@ -34,6 +34,36 @@ not a log line
 EOF
 fi
 
+if [ -n "${AEMLOG_FAKE_AIO_HOLD-}" ]; then
+  if [ -n "${AEMLOG_FAKE_AIO_PID-}" ]; then
+    printf '%s\n' "$$" > "$AEMLOG_FAKE_AIO_PID"
+  fi
+  if [ -n "${AEMLOG_FAKE_AIO_PGID-}" ]; then
+    pgid=$(ps -o pgid= -p $$ 2>/dev/null | tr -d ' \t')
+    printf '%s\n' "$pgid" > "$AEMLOG_FAKE_AIO_PGID"
+  fi
+  descendant=""
+  if [ -n "${AEMLOG_FAKE_AIO_DESCENDANT-}" ]; then
+    if [ -n "${AEMLOG_FAKE_AIO_IGNORE_TERM-}" ]; then
+      ( trap '' TERM
+        printf '%s\n' "$$" > "$AEMLOG_FAKE_AIO_DESCENDANT"
+        while true; do sleep 1; done
+      ) &
+    else
+      ( printf '%s\n' "$$" > "$AEMLOG_FAKE_AIO_DESCENDANT"
+        while true; do sleep 1; done
+      ) &
+    fi
+    descendant=$!
+  fi
+  if [ -n "${AEMLOG_FAKE_AIO_IGNORE_TERM-}" ]; then
+    trap '' TERM
+  else
+    trap 'exit 0' TERM
+  fi
+  while true; do sleep 1; done
+fi
+
 exit "${AEMLOG_FAKE_AIO_EXIT:-0}"
 "#;
 
@@ -42,6 +72,9 @@ struct FakeAio {
     record: PathBuf,
     stdin_record: PathBuf,
     logs: PathBuf,
+    pid_file: PathBuf,
+    pgid_file: PathBuf,
+    descendant: PathBuf,
 }
 
 impl FakeAio {
@@ -64,6 +97,9 @@ impl FakeAio {
             record: dir.join("args"),
             stdin_record: dir.join("stdin"),
             logs: dir.join("logs"),
+            pid_file: dir.join("aio.pid"),
+            pgid_file: dir.join("aio.pgid"),
+            descendant: dir.join("desc.pid"),
             dir,
         }
     }
@@ -124,6 +160,112 @@ fn run_with_fake(fake: &FakeAio, args: &[&str], stdin: Option<&[u8]>) -> Output 
         cmd.stdin(Stdio::null()).output().expect("run aemlog")
     };
     output
+}
+
+fn pid_alive(pid: i32) -> bool {
+    Command::new("kill")
+        .args(["-0", &pid.to_string()])
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false)
+}
+
+fn wait_pid_file(path: &std::path::Path) -> i32 {
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        if let Ok(text) = fs::read_to_string(path) {
+            if let Ok(pid) = text.trim().parse::<i32>() {
+                if pid > 0 {
+                    return pid;
+                }
+            }
+        }
+        if Instant::now() >= deadline {
+            panic!("pid file {} not written", path.display());
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+fn process_pgid(pid: u32) -> i32 {
+    let output = Command::new("ps")
+        .args(["-o", "pgid=", "-p", &pid.to_string()])
+        .output()
+        .expect("ps pgid");
+    String::from_utf8_lossy(&output.stdout)
+        .trim()
+        .parse()
+        .expect("pgid")
+}
+
+fn spawn_held_fake(fake: &FakeAio, ignore_term: bool) -> std::process::Child {
+    let mut cmd = aemlog();
+    cmd.args([
+        "--program-id",
+        "p1",
+        "--environment-id",
+        "e1",
+        "--service",
+        "author",
+        "--json",
+    ])
+    .env_clear()
+    .env("PATH", fake.path())
+    .env("AEMLOG_FAKE_AIO_RECORD", &fake.record)
+    .env("AEMLOG_FAKE_AIO_STDIN_RECORD", &fake.stdin_record)
+    .env("AEMLOG_FAKE_AIO_HOLD", "1")
+    .env("AEMLOG_FAKE_AIO_PID", &fake.pid_file)
+    .env("AEMLOG_FAKE_AIO_PGID", &fake.pgid_file)
+    .env("AEMLOG_FAKE_AIO_DESCENDANT", &fake.descendant)
+    .stdin(Stdio::null())
+    .stdout(Stdio::piped())
+    .stderr(Stdio::piped());
+    if ignore_term {
+        cmd.env("AEMLOG_FAKE_AIO_IGNORE_TERM", "1");
+    }
+    cmd.spawn().expect("spawn aemlog")
+}
+
+fn read_until_session_started(child: &mut std::process::Child) {
+    let stdout = child.stdout.as_mut().expect("piped stdout");
+    let mut buf = Vec::new();
+    let mut byte = [0u8; 1];
+    let deadline = Instant::now() + Duration::from_secs(3);
+    loop {
+        match stdout.read(&mut byte) {
+            Ok(1) => {
+                buf.push(byte[0]);
+                if byte[0] == b'\n' {
+                    let line = String::from_utf8_lossy(&buf);
+                    if line.contains("session_started") {
+                        return;
+                    }
+                    buf.clear();
+                }
+            }
+            Ok(0) => panic!(
+                "aemlog exited before session_started: {}",
+                String::from_utf8_lossy(&buf)
+            ),
+            Ok(_) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(err) => panic!("read aemlog stdout: {err}"),
+        }
+        if Instant::now() >= deadline {
+            panic!(
+                "timed out waiting for session_started: {}",
+                String::from_utf8_lossy(&buf)
+            );
+        }
+    }
+}
+
+fn interrupt(pid: u32) {
+    let status = Command::new("kill")
+        .args(["-INT", &pid.to_string()])
+        .status()
+        .expect("kill -INT");
+    assert!(status.success(), "kill -INT {pid} failed");
 }
 
 fn stdout(output: &Output) -> String {
@@ -403,4 +545,67 @@ java.lang.RuntimeException: boom\n\
     assert!(sample.contains("com.example.Foo.bar"), "{sample}");
     assert!(!sample.contains("ignored"), "{sample}");
     assert_eq!(recs[2]["count"], 2);
+}
+
+#[test]
+fn ctrl_c_terminates_group_and_exits_0() {
+    let fake = FakeAio::install();
+    let mut child = spawn_held_fake(&fake, false);
+    read_until_session_started(&mut child);
+    let analyzer_pid = child.id();
+    let analyzer_pgid = process_pgid(analyzer_pid);
+    let aio_pid = wait_pid_file(&fake.pid_file);
+    let aio_pgid = wait_pid_file(&fake.pgid_file);
+    let descendant = wait_pid_file(&fake.descendant);
+    assert_ne!(aio_pgid, analyzer_pgid, "aio must not share analyzer pgid");
+    assert_eq!(aio_pgid, aio_pid, "aio should lead its process group");
+    assert!(pid_alive(aio_pid));
+    assert!(pid_alive(descendant));
+
+    interrupt(analyzer_pid);
+    let output = child.wait_with_output().expect("wait aemlog");
+    assert_eq!(output.status.code(), Some(0), "stderr={}", stderr(&output));
+    let recs = json_lines(&output);
+    assert_eq!(recs.last().unwrap()["type"], "source_ended");
+    assert!(!pid_alive(aio_pid), "aio orphaned after ctrl-c");
+    assert!(!pid_alive(descendant), "descendant orphaned after ctrl-c");
+    assert_eq!(
+        fake.recorded_args(),
+        [
+            "cloudmanager",
+            "tail-log",
+            "e1",
+            "author",
+            "aemerror",
+            "--programId",
+            "p1",
+        ]
+    );
+}
+
+#[test]
+fn ctrl_c_sigkills_term_resistant_descendant() {
+    let fake = FakeAio::install();
+    let mut child = spawn_held_fake(&fake, true);
+    read_until_session_started(&mut child);
+    let analyzer_pid = child.id();
+    let analyzer_pgid = process_pgid(analyzer_pid);
+    let aio_pid = wait_pid_file(&fake.pid_file);
+    let aio_pgid = wait_pid_file(&fake.pgid_file);
+    let descendant = wait_pid_file(&fake.descendant);
+    assert_ne!(aio_pgid, analyzer_pgid);
+    assert!(pid_alive(descendant));
+
+    let started = Instant::now();
+    interrupt(analyzer_pid);
+    let output = child.wait_with_output().expect("wait aemlog");
+    let elapsed = started.elapsed();
+    assert_eq!(output.status.code(), Some(0), "stderr={}", stderr(&output));
+    assert!(elapsed >= Duration::from_secs(2), "{elapsed:?}");
+    assert!(elapsed < Duration::from_secs(6), "{elapsed:?}");
+    assert!(!pid_alive(aio_pid), "aio orphaned after forced kill");
+    assert!(
+        !pid_alive(descendant),
+        "term-resistant descendant orphaned"
+    );
 }
