@@ -452,8 +452,9 @@ pub(super) struct SourceOffsets {
 }
 
 impl<'a> EventMetadata<'a> {
-    /// Stable grouping identity. Request context and thread scheduling details
-    /// are evidence only and deliberately do not affect grouping.
+    /// Legacy exact-message identity. Request context and thread scheduling
+    /// details are evidence only. Live grouping uses [`crate::app::template`].
+    #[cfg(test)]
     pub(super) fn grouping_key(&self) -> String {
         format!(
             "{}\u{1f}{}\u{1f}{}",
