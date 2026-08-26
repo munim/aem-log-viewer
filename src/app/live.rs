@@ -7,7 +7,7 @@ use serde::Serialize;
 use uuid::Uuid;
 
 use super::cli::{Level, Request};
-use super::source;
+use super::source::{self, EndReason, STATE_ENDED, STATE_RUNNING, STATE_STARTING};
 use super::Error;
 
 struct Group {
@@ -40,6 +40,7 @@ enum Record<'a> {
         version: u32,
         session_id: &'a str,
         emitted_at: String,
+        source_state: &'a str,
         source: SourceMeta<'a>,
         levels: Vec<&'a str>,
     },
@@ -65,12 +66,17 @@ enum Record<'a> {
         version: u32,
         session_id: &'a str,
         emitted_at: String,
+        source_state: &'a str,
         status: Option<i32>,
+        reason: &'a str,
+        stderr: &'a str,
+        stderr_discarded: bool,
     },
 }
 
 pub(super) fn run(request: &Request) -> Result<(), Error> {
-    let mut child = spawn(request)?;
+    report_state(STATE_STARTING);
+    let mut child = source::spawn(request)?;
     let stdout = child
         .stdout
         .take()
@@ -79,14 +85,13 @@ pub(super) fn run(request: &Request) -> Result<(), Error> {
         .stderr
         .take()
         .ok_or_else(|| Error::Io("aio stderr was not piped".into()))?;
-    let drain = std::thread::spawn(move || {
-        let mut stderr = stderr;
-        let _ = std::io::copy(&mut stderr, &mut std::io::sink());
-    });
+    // Drain stderr independently so a child flooding either pipe cannot deadlock.
+    let drain = source::drain_stderr(stderr);
 
     let mut analyzer = Analyzer::new(request.levels.clone());
     let mut out = std::io::stdout().lock();
     analyzer.emit_session_started(request, &mut out)?;
+    report_state(STATE_RUNNING);
 
     for line in BufReader::new(stdout).lines() {
         let line = line.map_err(|err| Error::Io(err.to_string()))?;
@@ -94,19 +99,17 @@ pub(super) fn run(request: &Request) -> Result<(), Error> {
     }
 
     let status = wait_status(&mut child)?;
-    let _ = drain.join();
-    analyzer.emit_source_ended(status, &mut out)?;
-    Err(Error::UnexpectedEnd(
-        status
-            .map(|code| code.to_string())
-            .unwrap_or_else(|| "signal".into()),
-    ))
+    let tail = drain.join().unwrap_or_else(|_| source::StderrTail::new());
+    let raw_stderr = tail.snapshot();
+    let redacted = source::redact_stderr(&raw_stderr);
+    let reason = source::classify_end(status, &raw_stderr);
+    analyzer.emit_source_ended(status, reason, &redacted, tail.discarded_any(), &mut out)?;
+    report_state(STATE_ENDED);
+    Err(reason.into_error(status))
 }
 
-fn spawn(request: &Request) -> Result<Child, Error> {
-    source::command(request)
-        .spawn()
-        .map_err(|err| Error::Spawn(err.to_string()))
+fn report_state(state: &str) {
+    eprintln!("source: {state}");
 }
 
 fn wait_status(child: &mut Child) -> Result<Option<i32>, Error> {
@@ -134,6 +137,7 @@ impl Analyzer {
                 version: 1,
                 session_id: &self.session_id,
                 emitted_at: now_utc(),
+                source_state: STATE_RUNNING,
                 source: SourceMeta {
                     program_id: &request.program_id,
                     environment_id: &request.environment_id,
@@ -190,14 +194,25 @@ impl Analyzer {
         )
     }
 
-    fn emit_source_ended(&self, status: Option<i32>, out: &mut impl Write) -> Result<(), Error> {
+    fn emit_source_ended(
+        &self,
+        status: Option<i32>,
+        reason: EndReason,
+        stderr: &str,
+        stderr_discarded: bool,
+        out: &mut impl Write,
+    ) -> Result<(), Error> {
         emit(
             out,
             &Record::SourceEnded {
                 version: 1,
                 session_id: &self.session_id,
                 emitted_at: now_utc(),
+                source_state: STATE_ENDED,
                 status,
+                reason: reason.as_str(),
+                stderr,
+                stderr_discarded,
             },
         )
     }
@@ -305,7 +320,15 @@ mod tests {
         for line in lines {
             analyzer.ingest(line, &mut buf).unwrap();
         }
-        analyzer.emit_source_ended(Some(0), &mut buf).unwrap();
+        analyzer
+            .emit_source_ended(
+                Some(0),
+                EndReason::NormalExit,
+                "AIO_STDERR_MARKER",
+                false,
+                &mut buf,
+            )
+            .unwrap();
         parse_records(&buf)
     }
 
@@ -336,13 +359,21 @@ mod tests {
         let recs = records(vec![Level::Error], &[]);
         assert_eq!(recs[0]["type"], "session_started");
         assert_eq!(recs[0]["version"], 1);
+        assert_eq!(recs[0]["source_state"], STATE_RUNNING);
         assert_eq!(recs[0]["source"]["program_id"], "p1");
         assert_eq!(recs[0]["source"]["environment_id"], "e1");
         assert_eq!(recs[0]["source"]["service"], "author");
         assert_eq!(recs[0]["source"]["log"], "aemerror");
         assert_eq!(recs[0]["levels"], serde_json::json!(["ERROR"]));
         assert!(recs[0]["emitted_at"].as_str().unwrap().ends_with('Z'));
-        assert_eq!(recs.last().unwrap()["type"], "source_ended");
+        let last = recs.last().unwrap();
+        assert_eq!(last["type"], "source_ended");
+        assert_eq!(last["source_state"], STATE_ENDED);
+        assert_eq!(last["reason"], "normal_exit");
+        assert_eq!(last["stderr"], "AIO_STDERR_MARKER");
+        assert_eq!(last["stderr_discarded"], false);
+        let blob = recs.iter().map(|r| r.to_string()).collect::<String>();
+        assert!(!blob.to_ascii_lowercase().contains("connected"), "{blob}");
     }
 
     #[test]

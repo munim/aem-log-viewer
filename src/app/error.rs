@@ -29,10 +29,18 @@ pub(crate) enum Error {
         "stdout is not a terminal. TUI mode requires a TTY; use --json for redirected or piped output."
     )]
     NonTty,
+    #[error("aio executable not found on PATH")]
+    MissingAio,
     #[error("failed to start aio: {0}")]
     Spawn(String),
     #[error("aio I/O error: {0}")]
     Io(String),
+    #[error("aio authentication failed (status {status})")]
+    AuthFailure { status: String },
+    #[error("aio network failure (status {status})")]
+    NetworkFailure { status: String },
+    #[error("aio exited normally (status {0}); live tail stopped")]
+    NormalExit(String),
     #[error("source ended unexpectedly (aio status {0})")]
     UnexpectedEnd(String),
     /// Reserved for other startup failures after CLI validation (exit 1).
@@ -44,9 +52,14 @@ pub(crate) enum Error {
 impl Error {
     pub(crate) fn exit_code(&self) -> ExitCode {
         match self {
-            Self::Internal(_) | Self::Spawn(_) | Self::Io(_) | Self::UnexpectedEnd(_) => {
-                ExitCode::from(1)
-            }
+            Self::Internal(_)
+            | Self::MissingAio
+            | Self::Spawn(_)
+            | Self::Io(_)
+            | Self::AuthFailure { .. }
+            | Self::NetworkFailure { .. }
+            | Self::NormalExit(_)
+            | Self::UnexpectedEnd(_) => ExitCode::from(1),
             _ => ExitCode::from(2),
         }
     }
@@ -84,6 +97,16 @@ mod tests {
             Error::Spawn("not found".into()).exit_code(),
             ExitCode::from(1)
         );
+        assert_eq!(Error::MissingAio.exit_code(), ExitCode::from(1));
+        assert_eq!(
+            Error::AuthFailure { status: "1".into() }.exit_code(),
+            ExitCode::from(1)
+        );
+        assert_eq!(
+            Error::NetworkFailure { status: "1".into() }.exit_code(),
+            ExitCode::from(1)
+        );
+        assert_eq!(Error::NormalExit("0".into()).exit_code(), ExitCode::from(1));
         assert_eq!(
             Error::UnexpectedEnd("0".into()).exit_code(),
             ExitCode::from(1)
