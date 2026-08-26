@@ -1,0 +1,62 @@
+# aemlog version-1 analyzer tuning
+#
+# This file documents every configurable field, its default, unit, and allowed
+# range. Values below match built-in defaults and are accepted unchanged.
+#
+# Only analyzer behavior is configurable. Source identity (program, environment,
+# service, IMS context), AIO binary path, persistent mute rules, and
+# force-merge/split rules cannot appear here and are rejected as unknown fields.
+
+version = 1
+
+# Selected log levels (non-empty). Case-insensitive.
+# Allowed: TRACE, DEBUG, INFO, WARN, ERROR, FATAL.
+# Default: ["ERROR"]
+levels = ["ERROR"]
+
+# Timezone for zone-less source timestamps: "utc", "local", or an IANA name.
+# Default: "utc"
+timezone = "utc"
+
+[templates]
+# Fixed-token similarity. Unit: ratio. Allowed: 0.50 ..= 1.00. Default: 0.60
+similarity = 0.60
+# Maximum templates per identity bucket. Allowed: 1 ..= 1000. Default: 100
+bucket_cap = 100
+
+[groups]
+# Maximum normal groups. Allowed: 1 ..= 1000000. Default: 100000
+max = 100_000
+
+[event]
+# Maximum event size. Unit: bytes. Allowed: 1 ..= 16777216 (16 MiB). Default: 262144 (256 KiB)
+max_bytes = 262144
+# Maximum event lines. Allowed: 1 ..= 100000. Default: 2000
+max_lines = 2000
+
+[sample]
+# Maximum representative sample size. Unit: bytes. Allowed: 1 ..= 1048576 (1 MiB).
+# Must not exceed sample.budget_bytes. Default: 32768 (32 KiB)
+max_bytes = 32768
+# Global sample LRU budget. Unit: bytes. Allowed: 1 ..= 1073741824 (1 GiB). Default: 67108864 (64 MiB)
+budget_bytes = 67108864
+
+[rates]
+# Fast EWMA half-life. Unit: seconds. Allowed: 1 ..= 86400. Default: 10
+fast_half_life_secs = 10
+# Baseline EWMA half-life. Unit: seconds. Allowed: 1 ..= 86400.
+# Must be greater than rates.fast_half_life_secs. Default: 300 (5 minutes)
+baseline_half_life_secs = 300
+# New-view first-seen window. Unit: seconds. Allowed: 1 ..= 86400. Default: 60
+new_age_secs = 60
+# Increasing-view minimum group age. Unit: seconds. Allowed: 1 ..= 86400. Default: 60
+increasing_min_age_secs = 60
+# Increasing-view fast/baseline ratio. Allowed: 1.00 ..= 100.00. Default: 2.00
+increasing_ratio = 2.00
+# Increasing-view minimum fast rate. Unit: events/second. Allowed: 0.00 ..= 1000000.00. Default: 5.00
+increasing_min_rate = 5.00
+
+[redaction]
+# Extra JSON-redaction regexes. At most 32 patterns, each at most 1024 bytes.
+# Compiled at startup with linear-time Rust regex semantics. Default: []
+extra_patterns = []

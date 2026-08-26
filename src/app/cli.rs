@@ -20,8 +20,9 @@ duplicates are dropped; the default effective level is ERROR.
 Invalid program, environment, service, level, timezone, or output-flag combinations
 fail before any AIO process starts. Without --config, the first existing regular file
 among ~/aemlog.toml, ~/.config/aemlog/config.toml, executable-directory aemlog.toml,
-and working-directory aemlog.toml is loaded once. Files are never merged. Internal
-startup failures exit with status 1; invalid CLI input exits with status 2.
+and working-directory aemlog.toml is loaded once. A loaded file must set version = 1
+and may contain only analyzer tuning. Unknown fields are rejected. Files are never merged.
+Internal startup failures exit with status 1; invalid CLI input exits with status 2.
 ";
 
 #[derive(Debug, Parser)]
@@ -58,6 +59,7 @@ pub(super) struct RawArgs {
     service: Service,
 
     /// Log levels to select. Repeatable. Default: ERROR
+    // Empty vec means the flag was not supplied; do not add a Clap default.
     #[arg(long, value_enum, ignore_case = true, value_name = "LEVEL")]
     level: Vec<Level>,
 
@@ -70,6 +72,7 @@ pub(super) struct RawArgs {
     config: Option<PathBuf>,
 
     /// Timezone for zone-less source timestamps: utc (default), local, or IANA name
+    // None means the flag was not supplied; do not add a Clap default.
     #[arg(long, value_name = "TIMEZONE")]
     timezone: Option<String>,
 
@@ -132,7 +135,7 @@ pub(super) struct Request {
     pub(super) timezone: Timezone,
     pub(super) json: bool,
     pub(super) raw_sample: bool,
-    pub(super) loaded: Option<toml::Table>,
+    pub(super) tuning: super::tuning::Tuning,
 }
 
 impl Service {

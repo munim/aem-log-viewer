@@ -273,6 +273,7 @@ fn is_aem_timestamp(ts: &str) -> bool {
 mod tests {
     use super::*;
     use crate::app::cli::{Service, Timezone};
+    use crate::app::tuning::Tuning;
 
     const ERROR_A: &str = "26.08.2026 12:00:00.123 author-0 *ERROR* [FelixDispatchQueue] com.example.Foo Failed to start bundle";
     const ERROR_A_REPEAT: &str = "26.08.2026 12:00:01.000 author-1 *ERROR* [FelixDispatchQueue] com.example.Foo Failed to start bundle";
@@ -294,7 +295,7 @@ mod tests {
             timezone: Timezone::Utc,
             json: true,
             raw_sample: false,
-            loaded: None,
+            tuning: Tuning::default(),
         }
     }
 

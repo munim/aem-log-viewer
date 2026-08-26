@@ -1,10 +1,10 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use clap::ValueEnum;
 use toml::Value;
 
-use super::cli::{dedupe, CliInput, Level, Request, Timezone};
+use super::cli::{dedupe, CliInput, Request};
+use super::tuning::{self, Tuning};
 use super::Error;
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -34,7 +34,7 @@ impl SearchRoots {
 #[derive(Debug, Clone)]
 pub(super) struct LoadedConfig {
     pub path: PathBuf,
-    pub table: toml::Table,
+    pub tuning: Tuning,
 }
 
 pub(super) fn load(
@@ -51,42 +51,33 @@ pub(super) fn load(
 }
 
 pub(super) fn resolve(input: CliInput, loaded: Option<LoadedConfig>) -> Result<Request, Error> {
-    let file_timezone = match &loaded {
-        Some(file) => file.timezone()?,
-        None => None,
-    };
-    let file_levels = match &loaded {
-        Some(file) => file.levels()?,
-        None => None,
+    let mut tuning = match &loaded {
+        Some(file) => file.tuning.clone(),
+        None => Tuning::default(),
     };
 
-    let timezone = match input.timezone {
-        Some(timezone) => timezone,
-        None => file_timezone.unwrap_or(Timezone::Utc),
-    };
-    let levels = if !input.levels.is_empty() {
+    if !input.levels.is_empty() {
         let levels = dedupe(input.levels);
         if levels.is_empty() {
             return Err(Error::EmptyLevels);
         }
-        levels
-    } else if let Some(levels) = file_levels {
-        levels
-    } else {
-        vec![Level::Error]
-    };
+        tuning.levels = levels;
+    }
+    if let Some(timezone) = input.timezone {
+        tuning.timezone = timezone;
+    }
 
     Ok(Request {
         program_id: input.program_id,
         environment_id: input.environment_id,
         service: input.service,
-        levels,
+        levels: tuning.levels.clone(),
         ims_context: input.ims_context,
         config: loaded.as_ref().map(|file| file.path.clone()),
-        timezone,
+        timezone: tuning.timezone,
         json: input.json,
         raw_sample: input.raw_sample,
-        loaded: loaded.map(|file| file.table),
+        tuning,
     })
 }
 
@@ -138,9 +129,10 @@ fn load_required(path: &Path) -> Result<LoadedConfig, Error> {
         Value::Table(table) => table,
         _ => return Err(invalid(path, "root must be a table")),
     };
+    let tuning = tuning::from_table(&table).map_err(|message| invalid(path, message))?;
     Ok(LoadedConfig {
         path: path.to_path_buf(),
-        table,
+        tuning,
     })
 }
 
@@ -158,42 +150,6 @@ fn invalid(path: &Path, message: impl Into<String>) -> Error {
     }
 }
 
-impl LoadedConfig {
-    fn timezone(&self) -> Result<Option<Timezone>, Error> {
-        match self.table.get("timezone") {
-            None => Ok(None),
-            Some(Value::String(raw)) => Timezone::parse(raw)
-                .map(Some)
-                .map_err(|err| invalid(&self.path, err.to_string())),
-            Some(_) => Err(invalid(&self.path, "timezone must be a string")),
-        }
-    }
-
-    fn levels(&self) -> Result<Option<Vec<Level>>, Error> {
-        match self.table.get("levels") {
-            None => Ok(None),
-            Some(Value::Array(items)) => {
-                if items.is_empty() {
-                    return Err(invalid(&self.path, "levels must not be empty"));
-                }
-                let mut levels = Vec::with_capacity(items.len());
-                for (index, item) in items.iter().enumerate() {
-                    let raw = item.as_str().ok_or_else(|| {
-                        invalid(&self.path, format!("levels[{index}] must be a string"))
-                    })?;
-                    let level = Level::from_str(raw, true)
-                        .map_err(|_| invalid(&self.path, format!("invalid level '{raw}'")))?;
-                    if !levels.contains(&level) {
-                        levels.push(level);
-                    }
-                }
-                Ok(Some(levels))
-            }
-            Some(_) => Err(invalid(&self.path, "levels must be an array of strings")),
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use std::path::PathBuf;
@@ -201,8 +157,7 @@ mod tests {
     use std::{env, fs, process};
 
     use super::*;
-    use crate::app::cli::Service;
-
+    use crate::app::cli::{Level, Service, Timezone};
     static NEXT: AtomicU64 = AtomicU64::new(0);
 
     struct Scratch {
@@ -239,24 +194,28 @@ mod tests {
         }
 
         fn write_home(&self, body: &str) {
-            fs::write(self.home.join("aemlog.toml"), body).expect("home file");
+            fs::write(self.home.join("aemlog.toml"), versioned(body)).expect("home file");
         }
 
         fn write_xdg(&self, body: &str) {
-            fs::write(self.home.join(".config/aemlog/config.toml"), body).expect("xdg file");
+            fs::write(
+                self.home.join(".config/aemlog/config.toml"),
+                versioned(body),
+            )
+            .expect("xdg file");
         }
 
         fn write_exe(&self, body: &str) {
-            fs::write(self.exe.join("aemlog.toml"), body).expect("exe file");
+            fs::write(self.exe.join("aemlog.toml"), versioned(body)).expect("exe file");
         }
 
         fn write_cwd(&self, body: &str) {
-            fs::write(self.cwd.join("aemlog.toml"), body).expect("cwd file");
+            fs::write(self.cwd.join("aemlog.toml"), versioned(body)).expect("cwd file");
         }
 
         fn write_explicit(&self, name: &str, body: &str) -> PathBuf {
             let path = self.root.join(name);
-            fs::write(&path, body).expect("explicit file");
+            fs::write(&path, versioned(body)).expect("explicit file");
             path
         }
     }
@@ -290,6 +249,13 @@ mod tests {
         match load(input.config.as_deref(), roots) {
             Err(err) => err,
             Ok(loaded) => resolve(input, loaded).expect_err("expected resolve error"),
+        }
+    }
+    fn versioned(body: &str) -> String {
+        if body.contains("[[[") {
+            body.to_owned()
+        } else {
+            format!("version = 1\n{body}")
         }
     }
 
@@ -467,6 +433,10 @@ mod tests {
         let from_file = finish(base_input(), &roots);
         assert_eq!(from_file.timezone, Timezone::Local);
         assert_eq!(from_file.levels, vec![Level::Warn, Level::Error]);
+        assert_eq!(
+            from_file.tuning.similarity,
+            crate::app::tuning::DEFAULT_SIMILARITY
+        );
 
         let mut input = base_input();
         input.timezone = Some(Timezone::Utc);
@@ -474,6 +444,7 @@ mod tests {
         let from_cli = finish(input, &roots);
         assert_eq!(from_cli.timezone, Timezone::Utc);
         assert_eq!(from_cli.levels, vec![Level::Info]);
+        assert_eq!(from_cli.tuning.levels, vec![Level::Info]);
 
         let defaults = finish(
             base_input(),
@@ -486,6 +457,7 @@ mod tests {
         assert_eq!(defaults.timezone, Timezone::Utc);
         assert_eq!(defaults.levels, vec![Level::Error]);
         assert_eq!(defaults.config, None);
+        assert_eq!(defaults.tuning, Tuning::default());
     }
 
     #[test]
@@ -500,6 +472,68 @@ mod tests {
         let request = finish(input, &roots);
         assert_eq!(request.timezone, Timezone::Utc);
         assert_eq!(request.levels, vec![Level::Debug]);
+    }
+
+    #[test]
+    fn file_tuning_overrides_defaults_and_cli_does_not_mask() {
+        let scratch = Scratch::new();
+        scratch.write_cwd(
+            "\
+timezone = \"local\"
+levels = [\"WARN\"]
+[templates]
+similarity = 0.75
+bucket_cap = 50
+[groups]
+max = 10
+[event]
+max_bytes = 1024
+max_lines = 10
+[sample]
+max_bytes = 512
+budget_bytes = 2048
+[rates]
+fast_half_life_secs = 5
+baseline_half_life_secs = 20
+new_age_secs = 15
+increasing_min_age_secs = 30
+increasing_ratio = 3.0
+increasing_min_rate = 1.5
+[redaction]
+extra_patterns = [\"secret-[0-9]+\"]
+",
+        );
+        let mut roots = scratch.roots();
+        roots.home = None;
+        roots.exe_dir = None;
+
+        let from_file = finish(base_input(), &roots);
+        assert_eq!(from_file.timezone, Timezone::Local);
+        assert_eq!(from_file.levels, vec![Level::Warn]);
+        assert_eq!(from_file.tuning.similarity, 0.75);
+        assert_eq!(from_file.tuning.bucket_cap, 50);
+        assert_eq!(from_file.tuning.max_groups, 10);
+        assert_eq!(from_file.tuning.event_max_bytes, 1024);
+        assert_eq!(from_file.tuning.event_max_lines, 10);
+        assert_eq!(from_file.tuning.sample_max_bytes, 512);
+        assert_eq!(from_file.tuning.sample_budget_bytes, 2048);
+        assert_eq!(from_file.tuning.fast_half_life_secs, 5);
+        assert_eq!(from_file.tuning.baseline_half_life_secs, 20);
+        assert_eq!(from_file.tuning.new_age_secs, 15);
+        assert_eq!(from_file.tuning.increasing_min_age_secs, 30);
+        assert_eq!(from_file.tuning.increasing_ratio, 3.0);
+        assert_eq!(from_file.tuning.increasing_min_rate, 1.5);
+        assert_eq!(from_file.tuning.extra_patterns.len(), 1);
+
+        let mut input = base_input();
+        input.levels = vec![Level::Error];
+        input.timezone = Some(Timezone::Utc);
+        let from_cli = finish(input, &roots);
+        assert_eq!(from_cli.levels, vec![Level::Error]);
+        assert_eq!(from_cli.timezone, Timezone::Utc);
+        assert_eq!(from_cli.tuning.similarity, 0.75);
+        assert_eq!(from_cli.tuning.bucket_cap, 50);
+        assert_eq!(from_cli.tuning.max_groups, 10);
     }
 
     #[test]
