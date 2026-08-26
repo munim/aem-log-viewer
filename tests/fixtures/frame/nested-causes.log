@@ -1,0 +1,15 @@
+26.08.2026 12:00:04.200 author-0 *ERROR* [sling-default-2] com.example.core.servlets.ExportServlet Export failed
+java.lang.RuntimeException: export failed
+	at com.example.core.servlets.ExportServlet.doGet(ExportServlet.java:91)
+	at javax.servlet.http.HttpServlet.service(HttpServlet.java:645)
+
+Caused by: java.lang.IllegalStateException: repository session closed
+	at com.example.core.repo.SessionFactory.create(SessionFactory.java:44)
+	at com.example.core.servlets.ExportServlet.export(ExportServlet.java:140)
+	... 8 more
+	Suppressed: java.io.IOException: temp stream closed
+		at com.example.core.util.TempStream.close(TempStream.java:28)
+		at com.example.core.servlets.ExportServlet.doGet(ExportServlet.java:108)
+Caused by: javax.jcr.RepositoryException: workspace not found
+	at com.example.core.repo.WorkspaceOpener.open(WorkspaceOpener.java:17)
+	... 12 more

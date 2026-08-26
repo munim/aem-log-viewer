@@ -1,12 +1,15 @@
 use std::collections::HashMap;
-use std::io::{BufRead, BufReader, Write};
+use std::io::{Read, Write};
 use std::process::Child;
+use std::sync::mpsc;
+use std::time::Instant;
 
 use chrono::{SecondsFormat, Utc};
 use serde::Serialize;
 use uuid::Uuid;
 
 use super::cli::{Level, Request};
+use super::frame::{self, Frame, Framer};
 use super::source;
 use super::Error;
 
@@ -84,15 +87,54 @@ pub(super) fn run(request: &Request) -> Result<(), Error> {
         let _ = std::io::copy(&mut stderr, &mut std::io::sink());
     });
 
+    let (tx, rx) = mpsc::channel::<Option<Vec<u8>>>();
+    let reader = std::thread::spawn(move || {
+        let mut stdout = stdout;
+        let mut buf = [0u8; 8192];
+        loop {
+            match stdout.read(&mut buf) {
+                Ok(0) => {
+                    let _ = tx.send(None);
+                    break;
+                }
+                Ok(n) => {
+                    if tx.send(Some(buf[..n].to_vec())).is_err() {
+                        break;
+                    }
+                }
+                Err(_) => {
+                    let _ = tx.send(None);
+                    break;
+                }
+            }
+        }
+    });
+
     let mut analyzer = Analyzer::new(request.levels.clone());
+    let mut framer = Framer::new();
     let mut out = std::io::stdout().lock();
     analyzer.emit_session_started(request, &mut out)?;
 
-    for line in BufReader::new(stdout).lines() {
-        let line = line.map_err(|err| Error::Io(err.to_string()))?;
-        analyzer.ingest(&line, &mut out)?;
+    loop {
+        match rx.recv_timeout(frame::IDLE_FLUSH) {
+            Ok(Some(chunk)) => {
+                accept_frames(&mut analyzer, framer.push(&chunk, Instant::now()), &mut out)?;
+            }
+            Ok(None) => {
+                accept_frames(&mut analyzer, framer.finish(), &mut out)?;
+                break;
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                accept_frames(&mut analyzer, framer.poll_idle(Instant::now()), &mut out)?;
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                accept_frames(&mut analyzer, framer.finish(), &mut out)?;
+                break;
+            }
+        }
     }
 
+    let _ = reader.join();
     let status = wait_status(&mut child)?;
     let _ = drain.join();
     analyzer.emit_source_ended(status, &mut out)?;
@@ -114,6 +156,22 @@ fn wait_status(child: &mut Child) -> Result<Option<i32>, Error> {
         .wait()
         .map(|status| status.code())
         .map_err(|err| Error::Io(err.to_string()))
+}
+
+fn accept_frames(
+    analyzer: &mut Analyzer,
+    frames: Vec<Frame>,
+    out: &mut impl Write,
+) -> Result<(), Error> {
+    for item in frames {
+        match item {
+            Frame::Event(event) => analyzer.ingest(&event, out)?,
+            Frame::Unframed(text) => {
+                eprintln!("unframed input: {}", text.trim_end_matches(['\r', '\n']));
+            }
+        }
+    }
+    Ok(())
 }
 
 impl Analyzer {
@@ -146,8 +204,8 @@ impl Analyzer {
         )
     }
 
-    fn ingest(&mut self, line: &str, out: &mut impl Write) -> Result<(), Error> {
-        let Some((level, key)) = parse_aem_header(line) else {
+    fn ingest(&mut self, event: &str, out: &mut impl Write) -> Result<(), Error> {
+        let Some((level, key)) = frame::parse_event(event) else {
             return Ok(());
         };
         if !self.levels.contains(&level) {
@@ -185,7 +243,7 @@ impl Analyzer {
                 emitted_at: now_utc(),
                 group_id,
                 count: 1,
-                sample: line,
+                sample: event,
             },
         )
     }
@@ -212,61 +270,6 @@ fn emit(out: &mut impl Write, record: &Record<'_>) -> Result<(), Error> {
 
 fn now_utc() -> String {
     Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true)
-}
-
-/// Recognize a single-line AEM header: `dd.MM.yyyy HH:mm:ss.SSS <node> *LEVEL* <message>`.
-/// The grouping key is the exact `*LEVEL* …` suffix (timestamp and node excluded).
-fn parse_aem_header(line: &str) -> Option<(Level, &str)> {
-    let line = line.strip_suffix('\r').unwrap_or(line);
-    let ts = line.get(..23)?;
-    if !is_aem_timestamp(ts) {
-        return None;
-    }
-    if line.get(23..24)? != " " {
-        return None;
-    }
-    let rest = line.get(24..)?;
-    let (node, rest) = rest.split_once(' ')?;
-    if node.is_empty() {
-        return None;
-    }
-    if !rest.starts_with('*') {
-        return None;
-    }
-    let (level_token, after_level) = rest[1..].split_once('*')?;
-    let level = Level::from_aem(level_token)?;
-    let _message = after_level.strip_prefix(' ')?;
-    Some((level, rest))
-}
-
-fn is_aem_timestamp(ts: &str) -> bool {
-    let b = ts.as_bytes();
-    if b.len() != 23 {
-        return false;
-    }
-    let d = |i: usize| b[i].is_ascii_digit();
-    d(0) && d(1)
-        && b[2] == b'.'
-        && d(3)
-        && d(4)
-        && b[5] == b'.'
-        && d(6)
-        && d(7)
-        && d(8)
-        && d(9)
-        && b[10] == b' '
-        && d(11)
-        && d(12)
-        && b[13] == b':'
-        && d(14)
-        && d(15)
-        && b[16] == b':'
-        && d(17)
-        && d(18)
-        && b[19] == b'.'
-        && d(20)
-        && d(21)
-        && d(22)
 }
 
 #[cfg(test)]
@@ -320,16 +323,31 @@ mod tests {
     }
 
     #[test]
-    fn parse_requires_timestamp_node_and_level() {
-        let (level, key) = parse_aem_header(ERROR_A).expect("header");
-        assert_eq!(level, Level::Error);
-        assert_eq!(
-            key,
-            "*ERROR* [FelixDispatchQueue] com.example.Foo Failed to start bundle"
+    fn framed_multiline_stack_is_one_exact_group() {
+        let event = concat!(
+            "26.08.2026 12:00:00.123 author-0 *ERROR* [FelixDispatchQueue] com.example.Foo boom\n",
+            "java.lang.RuntimeException: boom\n",
+            "\tat com.example.Foo.bar(Foo.java:42)\n",
         );
-        assert!(parse_aem_header("not a log line").is_none());
-        assert!(parse_aem_header("26.08.2026 12:00:00.123").is_none());
-        assert!(parse_aem_header("26.08.2026 12:00:00.123 node *NOPE* x").is_none());
+        let repeat = concat!(
+            "26.08.2026 12:00:01.000 author-1 *ERROR* [FelixDispatchQueue] com.example.Foo boom\n",
+            "java.lang.RuntimeException: boom\n",
+            "\tat com.example.Foo.bar(Foo.java:42)\n",
+        );
+        let recs = records(vec![Level::Error], &[event, repeat]);
+        let types: Vec<&str> = recs.iter().map(|r| r["type"].as_str().unwrap()).collect();
+        assert_eq!(
+            types,
+            [
+                "session_started",
+                "group_created",
+                "group_updated",
+                "source_ended"
+            ]
+        );
+        assert_eq!(recs[1]["count"], 1);
+        assert_eq!(recs[1]["sample"], event);
+        assert_eq!(recs[2]["count"], 2);
     }
 
     #[test]

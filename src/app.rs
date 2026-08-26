@@ -1,6 +1,7 @@
 mod cli;
 mod config;
 mod error;
+mod frame;
 mod live;
 mod source;
 mod tuning;
