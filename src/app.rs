@@ -5,6 +5,7 @@ mod frame;
 mod live;
 mod redact;
 mod source;
+mod template;
 mod time;
 mod tuning;
 

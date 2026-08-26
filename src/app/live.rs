@@ -14,7 +14,10 @@ use super::cli::{Level, Request};
 use super::frame::{self, Frame, Framer};
 use super::redact::{RedactedRequestContext, Redactor};
 use super::source;
+use super::template::TemplateStore;
 use super::time::{self, TimeInterpreter};
+#[cfg(test)]
+use super::tuning::{DEFAULT_BUCKET_CAP, DEFAULT_SIMILARITY};
 use super::Error;
 
 struct Group {
@@ -34,6 +37,7 @@ struct Analyzer {
     times: TimeInterpreter,
     redactor: Redactor,
     raw_sample: bool,
+    templates: TemplateStore,
 }
 
 #[derive(Serialize)]
@@ -153,6 +157,8 @@ pub(super) fn run(request: &Request) -> Result<(), Error> {
         TimeInterpreter::new(request.timezone),
         Redactor::new(request.tuning.extra_patterns.clone()),
         request.raw_sample,
+        request.tuning.similarity,
+        request.tuning.bucket_cap,
     );
     let mut framer = Framer::with_limits(
         request.tuning.event_max_bytes,
@@ -245,6 +251,8 @@ impl Analyzer {
             TimeInterpreter::new(Timezone::Utc),
             Redactor::default(),
             false,
+            DEFAULT_SIMILARITY,
+            DEFAULT_BUCKET_CAP,
         )
     }
 
@@ -254,6 +262,8 @@ impl Analyzer {
         times: TimeInterpreter,
         redactor: Redactor,
         raw_sample: bool,
+        similarity: f64,
+        bucket_cap: u32,
     ) -> Self {
         Self {
             session_id: Uuid::new_v4().to_string(),
@@ -266,6 +276,7 @@ impl Analyzer {
             times,
             redactor,
             raw_sample,
+            templates: TemplateStore::new(similarity, bucket_cap),
         }
     }
 
@@ -310,7 +321,16 @@ impl Analyzer {
                     .redact_sample(metadata.timestamp, self.raw_sample)
             );
         }
-        let key = metadata.grouping_key();
+        let outcome = self.templates.learn(
+            metadata.level,
+            metadata.logger,
+            metadata.terminal_exception,
+            metadata.terminal_frame,
+            metadata.message,
+        );
+        let Some(key) = outcome.group_key() else {
+            return Ok(());
+        };
         if let Some(group) = self.groups.get_mut(&key) {
             group.count += 1;
             group.latest_effective =
@@ -448,6 +468,8 @@ mod tests {
             TimeInterpreter::new(Timezone::Utc),
             redactor,
             raw_sample,
+            DEFAULT_SIMILARITY,
+            DEFAULT_BUCKET_CAP,
         );
         let mut buf = Vec::new();
         analyzer.emit_session_started(&request(), &mut buf).unwrap();
@@ -607,6 +629,8 @@ mod tests {
             TimeInterpreter::new(Timezone::Utc),
             Redactor::default(),
             false,
+            DEFAULT_SIMILARITY,
+            DEFAULT_BUCKET_CAP,
         );
         let mut buf = Vec::new();
         analyzer.ingest(event, arrival(), &mut buf).unwrap();
@@ -639,20 +663,45 @@ mod tests {
             [
                 "session_started",
                 "group_created",
+                "group_updated",
+                "source_ended"
+            ]
+        );
+        assert_eq!(recs[1]["group_id"], 1);
+        assert_eq!(recs[2]["group_id"], 1);
+        assert_eq!(recs[2]["count"], 2);
+        let sample = recs[1]["sample"].as_str().unwrap();
+        assert!(!sample.contains("ops@example.com"), "{sample}");
+        assert!(sample.contains("[REDACTED:email]"), "{sample}");
+        assert_eq!(recs[1]["message"], "user [REDACTED:email] failed");
+    }
+
+    #[test]
+    fn learned_templates_group_paths_and_keep_frames_separate() {
+        let us = "26.08.2026 12:00:00.123 author-0 *ERROR* [FelixDispatchQueue] com.example.Foo Resource not found /content/site/us/en.html";
+        let de = "26.08.2026 12:00:01.000 author-1 *ERROR* [FelixDispatchQueue] com.example.Foo Resource not found /content/site/de/de.html";
+        let other_frame = concat!(
+            "26.08.2026 12:00:02.000 author-0 *ERROR* [FelixDispatchQueue] com.example.Foo Resource not found /content/site/fr/fr.html\n",
+            "java.lang.RuntimeException: missing\n",
+            "\tat com.example.Foo.bar(Foo.java:42)\n",
+        );
+        let recs = records(vec![Level::Error], &[us, de, other_frame]);
+        let types: Vec<&str> = recs.iter().map(|r| r["type"].as_str().unwrap()).collect();
+        assert_eq!(
+            types,
+            [
+                "session_started",
+                "group_created",
+                "group_updated",
                 "group_created",
                 "source_ended"
             ]
         );
         assert_eq!(recs[1]["group_id"], 1);
-        assert_eq!(recs[2]["group_id"], 2);
-        let sample_a = recs[1]["sample"].as_str().unwrap();
-        let sample_b = recs[2]["sample"].as_str().unwrap();
-        assert!(!sample_a.contains("ops@example.com"), "{sample_a}");
-        assert!(!sample_b.contains("admin@example.net"), "{sample_b}");
-        assert!(sample_a.contains("[REDACTED:email]"), "{sample_a}");
-        assert!(sample_b.contains("[REDACTED:email]"), "{sample_b}");
-        assert_eq!(recs[1]["message"], "user [REDACTED:email] failed");
-        assert_eq!(recs[2]["message"], "user [REDACTED:email] failed");
+        assert_eq!(recs[2]["group_id"], 1);
+        assert_eq!(recs[3]["group_id"], 2);
+        assert_eq!(recs[3]["terminal_exception"], "java.lang.RuntimeException");
+        assert_eq!(recs[3]["terminal_frame"], "com.example.Foo.bar");
     }
 
     #[test]
@@ -717,6 +766,8 @@ mod tests {
             TimeInterpreter::new(Timezone::Utc),
             Redactor::default(),
             false,
+            DEFAULT_SIMILARITY,
+            DEFAULT_BUCKET_CAP,
         );
         let mut buf = Vec::new();
         analyzer.ingest(&event, arrival(), &mut buf).unwrap();
@@ -750,6 +801,8 @@ mod tests {
             TimeInterpreter::new(Timezone::Iana("America/New_York".parse().expect("zone"))),
             Redactor::default(),
             false,
+            DEFAULT_SIMILARITY,
+            DEFAULT_BUCKET_CAP,
         );
         let mut buf = Vec::new();
         analyzer.ingest(ERROR_A, arrival(), &mut buf).unwrap();
@@ -766,6 +819,8 @@ mod tests {
             TimeInterpreter::new(Timezone::Iana("America/New_York".parse().expect("zone"))),
             Redactor::default(),
             false,
+            DEFAULT_SIMILARITY,
+            DEFAULT_BUCKET_CAP,
         );
         let gap =
             "08.03.2026 02:30:00.000 author-0 *ERROR* [FelixDispatchQueue] com.example.Foo spring";
