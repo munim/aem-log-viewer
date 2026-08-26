@@ -4,6 +4,7 @@ mod error;
 mod frame;
 mod live;
 mod source;
+mod time;
 mod tuning;
 
 use std::io::IsTerminal;

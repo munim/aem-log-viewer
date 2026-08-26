@@ -4,18 +4,24 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
-use chrono::{SecondsFormat, Utc};
+use chrono::{DateTime, Utc};
 use serde::Serialize;
 use uuid::Uuid;
 
+#[cfg(test)]
+use super::cli::Timezone;
 use super::cli::{Level, Request};
 use super::frame::{self, Frame, Framer};
 use super::source;
+use super::time::{self, TimeInterpreter};
 use super::Error;
 
 struct Group {
     id: u64,
     count: u64,
+    /// Monotonic source clock for later rate work. Never moves backward.
+    #[allow(dead_code)]
+    latest_effective: DateTime<Utc>,
 }
 
 struct Analyzer {
@@ -24,6 +30,7 @@ struct Analyzer {
     groups: HashMap<String, Group>,
     next_group_id: u64,
     sample_max_bytes: usize,
+    times: TimeInterpreter,
 }
 
 #[derive(Serialize)]
@@ -56,6 +63,8 @@ enum Record<'a> {
         count: u64,
         sample: String,
         timestamp: &'a str,
+        #[serde(skip_serializing_if = "std::ops::Not::not")]
+        time_fallback: bool,
         node: &'a str,
         level: &'a str,
         thread: &'a str,
@@ -134,8 +143,11 @@ pub(super) fn run(request: &Request) -> Result<(), Error> {
         }
     });
 
-    let mut analyzer =
-        Analyzer::with_sample_limit(request.levels.clone(), request.tuning.sample_max_bytes);
+    let mut analyzer = Analyzer::with_sample_limit(
+        request.levels.clone(),
+        request.tuning.sample_max_bytes,
+        TimeInterpreter::new(request.timezone),
+    );
     let mut framer = Framer::with_limits(
         request.tuning.event_max_bytes,
         request.tuning.event_max_lines,
@@ -199,7 +211,7 @@ fn accept_frames(
 ) -> Result<(), Error> {
     for item in frames {
         match item {
-            Frame::Event(event) => analyzer.ingest(&event, out)?,
+            Frame::Event(event) => analyzer.ingest(&event, Utc::now(), out)?,
             Frame::Diagnostic(diag) => {
                 eprintln!(
                     "parser diagnostic: {} count={} line={} offset={} sample={}",
@@ -218,10 +230,14 @@ fn accept_frames(
 impl Analyzer {
     #[cfg(test)]
     fn new(levels: Vec<Level>) -> Self {
-        Self::with_sample_limit(levels, u64::MAX)
+        Self::with_sample_limit(levels, u64::MAX, TimeInterpreter::new(Timezone::Utc))
     }
 
-    fn with_sample_limit(levels: Vec<Level>, sample_max_bytes: u64) -> Self {
+    fn with_sample_limit(
+        levels: Vec<Level>,
+        sample_max_bytes: u64,
+        times: TimeInterpreter,
+    ) -> Self {
         Self {
             session_id: Uuid::new_v4().to_string(),
             levels,
@@ -230,6 +246,7 @@ impl Analyzer {
             sample_max_bytes: usize::try_from(sample_max_bytes)
                 .unwrap_or(usize::MAX)
                 .max(1),
+            times,
         }
     }
 
@@ -253,16 +270,31 @@ impl Analyzer {
         )
     }
 
-    fn ingest(&mut self, event: &str, out: &mut impl Write) -> Result<(), Error> {
+    fn ingest(
+        &mut self,
+        event: &str,
+        arrived_at: DateTime<Utc>,
+        out: &mut impl Write,
+    ) -> Result<(), Error> {
         let Some(metadata) = frame::parse_metadata(event) else {
             return Ok(());
         };
         if !self.levels.contains(&metadata.level) {
             return Ok(());
         }
+        let interpreted = self.times.interpret(metadata.timestamp, arrived_at);
+        if let Some(fault) = interpreted.fallback {
+            eprintln!(
+                "parser diagnostic: {} sample={}",
+                fault.as_str(),
+                metadata.timestamp
+            );
+        }
         let key = metadata.grouping_key();
         if let Some(group) = self.groups.get_mut(&key) {
             group.count += 1;
+            group.latest_effective =
+                time::clamp_effective(Some(group.latest_effective), interpreted.instant);
             let group_id = group.id;
             let count = group.count;
             return emit(
@@ -276,6 +308,7 @@ impl Analyzer {
                 },
             );
         }
+        let timestamp = time::rfc3339_millis(interpreted.instant);
         let group_id = self.next_group_id;
         self.next_group_id += 1;
         self.groups.insert(
@@ -283,6 +316,7 @@ impl Analyzer {
             Group {
                 id: group_id,
                 count: 1,
+                latest_effective: interpreted.instant,
             },
         );
         emit(
@@ -294,7 +328,8 @@ impl Analyzer {
                 group_id,
                 count: 1,
                 sample: frame::bound_sample(event, self.sample_max_bytes),
-                timestamp: metadata.timestamp,
+                timestamp: &timestamp,
+                time_fallback: interpreted.fallback.is_some(),
                 node: metadata.node,
                 level: metadata.level.as_str(),
                 thread: metadata.thread,
@@ -329,14 +364,19 @@ fn emit(out: &mut impl Write, record: &Record<'_>) -> Result<(), Error> {
 }
 
 fn now_utc() -> String {
-    Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true)
+    time::rfc3339_millis(Utc::now())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::app::cli::{Service, Timezone};
+    use crate::app::cli::Service;
     use crate::app::tuning::Tuning;
+    use chrono::TimeZone;
+
+    fn arrival() -> DateTime<Utc> {
+        Utc.with_ymd_and_hms(2026, 8, 26, 20, 0, 0).unwrap()
+    }
 
     const ERROR_A: &str = "26.08.2026 12:00:00.123 author-0 *ERROR* [FelixDispatchQueue] com.example.Foo Failed to start bundle";
     const ERROR_A_REPEAT: &str = "26.08.2026 12:00:01.000 author-1 *ERROR* [FelixDispatchQueue] com.example.Foo Failed to start bundle";
@@ -367,7 +407,7 @@ mod tests {
         let mut buf = Vec::new();
         analyzer.emit_session_started(&request(), &mut buf).unwrap();
         for line in lines {
-            analyzer.ingest(line, &mut buf).unwrap();
+            analyzer.ingest(line, arrival(), &mut buf).unwrap();
         }
         analyzer.emit_source_ended(Some(0), &mut buf).unwrap();
         parse_records(&buf)
@@ -516,11 +556,16 @@ mod tests {
             "message with a deliberately long continuation\n",
             "stack continuation\n",
         );
-        let mut analyzer = Analyzer::with_sample_limit(vec![Level::Error], 24);
+        let mut analyzer = Analyzer::with_sample_limit(
+            vec![Level::Error],
+            24,
+            TimeInterpreter::new(Timezone::Utc),
+        );
         let mut buf = Vec::new();
-        analyzer.ingest(event, &mut buf).unwrap();
+        analyzer.ingest(event, arrival(), &mut buf).unwrap();
         let record = parse_records(&buf).pop().expect("group record");
-        assert_eq!(record["timestamp"], "26.08.2026 12:00:00.123");
+        assert_eq!(record["timestamp"], "2026-08-26T12:00:00.123Z");
+        assert!(record.get("time_fallback").is_none());
         assert_eq!(record["node"], "author-0");
         assert_eq!(record["level"], "ERROR");
         assert_eq!(record["thread"], "worker-1");
@@ -548,6 +593,56 @@ mod tests {
         assert_eq!(recs[1]["terminal_exception"], "java.lang.RuntimeException");
         assert_eq!(recs[1]["terminal_frame"], "com.example.Foo.bar");
         assert_eq!(recs[1]["sample"], event);
+    }
+
+    #[test]
+    fn iana_zone_emits_utc_rfc3339_timestamp() {
+        let mut analyzer = Analyzer::with_sample_limit(
+            vec![Level::Error],
+            u64::MAX,
+            TimeInterpreter::new(Timezone::Iana("America/New_York".parse().expect("zone"))),
+        );
+        let mut buf = Vec::new();
+        analyzer.ingest(ERROR_A, arrival(), &mut buf).unwrap();
+        let record = parse_records(&buf).pop().expect("group record");
+        assert_eq!(record["timestamp"], "2026-08-26T16:00:00.123Z");
+        assert!(record.get("time_fallback").is_none());
+    }
+
+    #[test]
+    fn dst_faults_mark_arrival_fallback() {
+        let mut analyzer = Analyzer::with_sample_limit(
+            vec![Level::Error],
+            u64::MAX,
+            TimeInterpreter::new(Timezone::Iana("America/New_York".parse().expect("zone"))),
+        );
+        let gap =
+            "08.03.2026 02:30:00.000 author-0 *ERROR* [FelixDispatchQueue] com.example.Foo spring";
+        let fold =
+            "01.11.2026 01:30:00.000 author-0 *ERROR* [FelixDispatchQueue] com.example.Bar fall";
+        let mut buf = Vec::new();
+        analyzer.ingest(gap, arrival(), &mut buf).unwrap();
+        analyzer.ingest(fold, arrival(), &mut buf).unwrap();
+        let recs = parse_records(&buf);
+        assert_eq!(recs[0]["timestamp"], "2026-08-26T20:00:00.000Z");
+        assert_eq!(recs[0]["time_fallback"], true);
+        assert_eq!(recs[1]["timestamp"], "2026-08-26T20:00:00.000Z");
+        assert_eq!(recs[1]["time_fallback"], true);
+    }
+
+    #[test]
+    fn out_of_order_nodes_cannot_move_group_clock_backward() {
+        let mut analyzer = Analyzer::new(vec![Level::Error]);
+        let later = "26.08.2026 12:00:02.000 author-0 *ERROR* [FelixDispatchQueue] com.example.Foo Failed to start bundle";
+        let earlier = "26.08.2026 12:00:01.000 author-1 *ERROR* [FelixDispatchQueue] com.example.Foo Failed to start bundle";
+        let mut buf = Vec::new();
+        analyzer.ingest(later, arrival(), &mut buf).unwrap();
+        analyzer.ingest(earlier, arrival(), &mut buf).unwrap();
+        let first = Utc.with_ymd_and_hms(2026, 8, 26, 12, 0, 2).unwrap();
+        assert_eq!(
+            analyzer.groups.values().next().unwrap().latest_effective,
+            first
+        );
     }
 
     fn is_uuid_v4(id: &str) -> bool {
