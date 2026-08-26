@@ -111,7 +111,11 @@ pub(super) fn run(request: &Request) -> Result<(), Error> {
     });
 
     let mut analyzer = Analyzer::new(request.levels.clone());
-    let mut framer = Framer::new();
+    let mut framer = Framer::with_limits(
+        request.tuning.event_max_bytes,
+        request.tuning.event_max_lines,
+        request.tuning.sample_max_bytes,
+    );
     let mut out = std::io::stdout().lock();
     analyzer.emit_session_started(request, &mut out)?;
 
@@ -166,8 +170,15 @@ fn accept_frames(
     for item in frames {
         match item {
             Frame::Event(event) => analyzer.ingest(&event, out)?,
-            Frame::Unframed(text) => {
-                eprintln!("unframed input: {}", text.trim_end_matches(['\r', '\n']));
+            Frame::Diagnostic(diag) => {
+                eprintln!(
+                    "parser diagnostic: {} count={} line={} offset={} sample={}",
+                    diag.reason.as_str(),
+                    diag.count,
+                    diag.line,
+                    diag.offset,
+                    diag.sample.trim_end_matches(['\r', '\n']),
+                );
             }
         }
     }
@@ -402,6 +413,51 @@ mod tests {
         let recs = records(vec![Level::Error], &[]);
         let id = recs[0]["session_id"].as_str().unwrap();
         assert!(is_uuid_v4(id), "{id}");
+    }
+
+    #[test]
+    fn parser_diagnostics_do_not_create_or_rank_groups() {
+        use crate::app::frame::{Diagnostic, DiagnosticReason};
+
+        let mut analyzer = Analyzer::new(vec![Level::Error]);
+        let mut buf = Vec::new();
+        analyzer.emit_session_started(&request(), &mut buf).unwrap();
+        accept_frames(
+            &mut analyzer,
+            vec![
+                Frame::Diagnostic(Diagnostic {
+                    reason: DiagnosticReason::UnframedPrefix,
+                    count: 7,
+                    sample: "garbage".into(),
+                    line: 1,
+                    offset: 0,
+                }),
+                Frame::Diagnostic(Diagnostic {
+                    reason: DiagnosticReason::EventByteLimit,
+                    count: 40,
+                    sample: "xxxx".into(),
+                    line: 2,
+                    offset: 10,
+                }),
+                Frame::Event(ERROR_A.into()),
+                Frame::Diagnostic(Diagnostic {
+                    reason: DiagnosticReason::InvalidUtf8,
+                    count: 1,
+                    sample: "\u{FFFD}".into(),
+                    line: 3,
+                    offset: 20,
+                }),
+            ],
+            &mut buf,
+        )
+        .unwrap();
+        analyzer.emit_source_ended(Some(0), &mut buf).unwrap();
+        let recs = parse_records(&buf);
+        let types: Vec<&str> = recs.iter().map(|r| r["type"].as_str().unwrap()).collect();
+        assert_eq!(types, ["session_started", "group_created", "source_ended"]);
+        assert_eq!(recs[1]["sample"], ERROR_A);
+        assert_eq!(recs[1]["count"], 1);
+        assert_eq!(analyzer.groups.len(), 1);
     }
 
     fn is_uuid_v4(id: &str) -> bool {
