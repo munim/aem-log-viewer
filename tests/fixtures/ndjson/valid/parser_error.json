@@ -1,0 +1,12 @@
+{
+  "version": 1,
+  "type": "parser_error",
+  "session_id": "550e8400-e29b-41d4-a716-446655440000",
+  "emitted_at": "2026-08-26T12:00:00.500Z",
+  "reason": "unframed_prefix",
+  "count": 7,
+  "sample": "garbage leftover",
+  "sample_truncated": false,
+  "line": 1,
+  "offset": 0
+}

@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::io::{Read, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc;
+use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use chrono::{DateTime, Utc};
@@ -184,6 +184,8 @@ struct Analyzer {
     selected_events: u64,
     diagnostics: u64,
     emit_diagnostics: bool,
+    dirty: HashSet<u64>,
+    last_record_at: HashMap<u64, Instant>,
 }
 
 #[derive(Serialize)]
@@ -215,12 +217,20 @@ enum Record<'a> {
         emitted_at: String,
         group_id: u64,
         count: u64,
+        first_seen: String,
+        last_seen: String,
+        template: String,
+        nodes: Vec<String>,
+        muted: bool,
+        level: &'a str,
         sample: String,
+        sample_truncated: bool,
+        fast_rate: f64,
+        baseline_rate: f64,
         timestamp: &'a str,
         #[serde(skip_serializing_if = "std::ops::Not::not")]
         time_fallback: bool,
         node: String,
-        level: &'a str,
         thread: String,
         logger: String,
         message: String,
@@ -242,7 +252,11 @@ enum Record<'a> {
         template: String,
         nodes: Vec<String>,
         muted: bool,
+        level: &'a str,
         sample: String,
+        sample_truncated: bool,
+        fast_rate: f64,
+        baseline_rate: f64,
     },
     #[serde(rename = "group_updated")]
     GroupUpdated {
@@ -251,6 +265,26 @@ enum Record<'a> {
         emitted_at: String,
         group_id: u64,
         count: u64,
+        first_seen: String,
+        last_seen: String,
+        template: String,
+        nodes: Vec<String>,
+        muted: bool,
+        level: &'a str,
+        fast_rate: f64,
+        baseline_rate: f64,
+    },
+    #[serde(rename = "parser_error")]
+    ParserError {
+        version: u32,
+        session_id: &'a str,
+        emitted_at: String,
+        reason: &'a str,
+        count: u64,
+        sample: String,
+        sample_truncated: bool,
+        line: u64,
+        offset: u64,
     },
     #[serde(rename = "source_ended")]
     SourceEnded {
@@ -258,7 +292,63 @@ enum Record<'a> {
         session_id: &'a str,
         emitted_at: String,
         status: Option<i32>,
+        stderr: String,
+        stderr_truncated: bool,
     },
+}
+
+const STDERR_TAIL: usize = 64 * 1024;
+const PIPE_QUEUE: usize = 16;
+const UPDATE_COALESCE: Duration = Duration::from_secs(1);
+
+struct StderrTail {
+    bytes: Vec<u8>,
+    truncated: bool,
+}
+
+impl StderrTail {
+    fn new() -> Self {
+        Self {
+            bytes: Vec::new(),
+            truncated: false,
+        }
+    }
+
+    fn push(&mut self, chunk: &[u8]) {
+        if chunk.is_empty() {
+            return;
+        }
+        if chunk.len() > STDERR_TAIL {
+            self.bytes.clear();
+            self.bytes
+                .extend_from_slice(&chunk[chunk.len() - STDERR_TAIL..]);
+            self.truncated = true;
+            return;
+        }
+        if chunk.len() == STDERR_TAIL {
+            self.truncated |= !self.bytes.is_empty();
+            self.bytes.clear();
+            self.bytes.extend_from_slice(chunk);
+            return;
+        }
+        let overflow = self
+            .bytes
+            .len()
+            .saturating_add(chunk.len())
+            .saturating_sub(STDERR_TAIL);
+        if overflow > 0 {
+            self.bytes.drain(..overflow);
+            self.truncated = true;
+        }
+        self.bytes.extend_from_slice(chunk);
+    }
+
+    fn snapshot(&self) -> (String, bool) {
+        (
+            String::from_utf8_lossy(&self.bytes).into_owned(),
+            self.truncated,
+        )
+    }
 }
 
 static USER_STOP: AtomicBool = AtomicBool::new(false);
@@ -272,6 +362,7 @@ extern "C" fn on_sigint(_: libc::c_int) {
 fn install_user_stop_handler() {
     unsafe {
         libc::signal(libc::SIGINT, on_sigint as *const () as libc::sighandler_t);
+        libc::signal(libc::SIGPIPE, libc::SIG_IGN);
     }
 }
 
@@ -284,12 +375,20 @@ pub(super) fn run(request: &Request) -> Result<(), Error> {
     let stderr = source
         .take_stderr()
         .ok_or_else(|| Error::Io("aio stderr was not piped".into()))?;
+    let tail = Arc::new(Mutex::new(StderrTail::new()));
+    let drain_tail = Arc::clone(&tail);
     let drain = std::thread::spawn(move || {
         let mut stderr = stderr;
-        let _ = std::io::copy(&mut stderr, &mut std::io::sink());
+        let mut buf = [0u8; 8192];
+        loop {
+            match stderr.read(&mut buf) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => drain_tail.lock().expect("stderr tail").push(&buf[..n]),
+            }
+        }
     });
 
-    let (tx, rx) = mpsc::channel::<Option<Vec<u8>>>();
+    let (tx, rx) = mpsc::sync_channel::<Option<Vec<u8>>>(PIPE_QUEUE);
     let reader = std::thread::spawn(move || {
         let mut stdout = stdout;
         let mut buf = [0u8; 8192];
@@ -329,6 +428,7 @@ pub(super) fn run(request: &Request) -> Result<(), Error> {
     analyzer.emit_session_started(request, &mut out)?;
 
     let mut user_stop = false;
+    let mut broken_stdout = false;
     loop {
         if USER_STOP.load(Ordering::SeqCst) {
             user_stop = true;
@@ -336,17 +436,52 @@ pub(super) fn run(request: &Request) -> Result<(), Error> {
         }
         match rx.recv_timeout(STOP_POLL) {
             Ok(Some(chunk)) => {
-                accept_frames(&mut analyzer, framer.push(&chunk, Instant::now()), &mut out)?;
+                if let Err(err) =
+                    accept_frames(&mut analyzer, framer.push(&chunk, Instant::now()), &mut out)
+                {
+                    if is_broken_pipe(&err) {
+                        broken_stdout = true;
+                        break;
+                    }
+                    return Err(err);
+                }
             }
             Ok(None) => {
-                accept_frames(&mut analyzer, framer.finish(), &mut out)?;
+                if let Err(err) = accept_frames(&mut analyzer, framer.finish(), &mut out) {
+                    if is_broken_pipe(&err) {
+                        broken_stdout = true;
+                        break;
+                    }
+                    return Err(err);
+                }
                 break;
             }
             Err(mpsc::RecvTimeoutError::Timeout) => {
-                accept_frames(&mut analyzer, framer.poll_idle(Instant::now()), &mut out)?;
+                if let Err(err) =
+                    accept_frames(&mut analyzer, framer.poll_idle(Instant::now()), &mut out)
+                {
+                    if is_broken_pipe(&err) {
+                        broken_stdout = true;
+                        break;
+                    }
+                    return Err(err);
+                }
+                if let Err(err) = analyzer.flush_due_updates(Instant::now(), &mut out) {
+                    if is_broken_pipe(&err) {
+                        broken_stdout = true;
+                        break;
+                    }
+                    return Err(err);
+                }
             }
             Err(mpsc::RecvTimeoutError::Disconnected) => {
-                accept_frames(&mut analyzer, framer.finish(), &mut out)?;
+                if let Err(err) = accept_frames(&mut analyzer, framer.finish(), &mut out) {
+                    if is_broken_pipe(&err) {
+                        broken_stdout = true;
+                        break;
+                    }
+                    return Err(err);
+                }
                 break;
             }
         }
@@ -356,16 +491,22 @@ pub(super) fn run(request: &Request) -> Result<(), Error> {
         user_stop = true;
     }
 
-    // Drain continues on the helper threads while the group is signaled.
-    let status = if user_stop {
+    let status = if user_stop || broken_stdout {
         source.shutdown()?
     } else {
         source.wait()?
     };
     let _ = reader.join();
     let _ = drain.join();
-    analyzer.emit_source_ended(status, &mut out)?;
-    if user_stop {
+    let (stderr_raw, stderr_truncated) = tail.lock().expect("stderr tail").snapshot();
+    let stderr_text = analyzer.redactor.redact(&stderr_raw);
+    if !broken_stdout {
+        analyzer.flush_pending_updates(Instant::now(), &mut out)?;
+        analyzer.emit_source_ended(status, stderr_text, stderr_truncated, &mut out)?;
+    }
+    if broken_stdout {
+        Err(Error::Io("broken stdout".into()))
+    } else if user_stop {
         Ok(())
     } else {
         Err(Error::UnexpectedEnd(
@@ -600,7 +741,7 @@ fn accept_frames_with(
 ) -> Result<(), Error> {
     for item in frames {
         match item {
-            Frame::Event(event) => analyzer.ingest(&event, Utc::now(), out)?,
+            Frame::Event(event) => analyzer.ingest(&event, Utc::now(), Instant::now(), out)?,
             Frame::Diagnostic(diag) => {
                 analyzer.diagnostics = analyzer.diagnostics.saturating_add(diag.count.max(1));
                 if emit_diagnostics {
@@ -615,6 +756,7 @@ fn accept_frames_with(
                             .redact_sample(&diag.sample, analyzer.raw_sample)
                             .trim_end_matches(['\r', '\n']),
                     );
+                    analyzer.emit_parser_error(&diag, out)?;
                 }
             }
         }
@@ -669,6 +811,8 @@ impl Analyzer {
             selected_events: 0,
             diagnostics: 0,
             emit_diagnostics: true,
+            dirty: HashSet::new(),
+            last_record_at: HashMap::new(),
         }
     }
 
@@ -701,6 +845,7 @@ impl Analyzer {
         &mut self,
         event: &str,
         arrived_at: DateTime<Utc>,
+        now: Instant,
         out: &mut impl Write,
     ) -> Result<(), Error> {
         let Some(metadata) = frame::parse_metadata(event) else {
@@ -770,9 +915,11 @@ impl Analyzer {
                 self.sample_max_bytes,
             );
             let sample = captured.text.clone();
+            let sample_truncated = captured.meta.truncated;
             self.samples.insert(group_id, captured.text);
             let bucket = outcome.bucket().expect("learned bucket").clone();
             let index = outcome.index().expect("learned index");
+            let rate = RateState::first(interpreted.instant, &self.rate_params);
             self.groups.insert(
                 key.clone(),
                 Group {
@@ -785,10 +932,13 @@ impl Analyzer {
                     muted: false,
                     bucket,
                     index,
-                    rate: RateState::first(interpreted.instant, &self.rate_params),
+                    rate,
                 },
             );
             let timestamp = time::rfc3339_millis(interpreted.instant);
+            let group = self.groups.get(&key).expect("just inserted");
+            let (fast_rate, baseline_rate) = rounded_rates(group, &self.rate_params);
+            let template = self.template_text(&group.bucket, group.index);
             emit(
                 out,
                 &Record::GroupCreated {
@@ -797,11 +947,19 @@ impl Analyzer {
                     emitted_at: now_utc(),
                     group_id,
                     count: 1,
+                    first_seen: time::rfc3339_millis(interpreted.instant),
+                    last_seen: time::rfc3339_millis(interpreted.instant),
+                    template,
+                    nodes: vec![node.clone()],
+                    muted: false,
+                    level: metadata.level.as_str(),
                     sample,
+                    sample_truncated,
+                    fast_rate,
+                    baseline_rate,
                     timestamp: &timestamp,
                     time_fallback: interpreted.fallback.is_some(),
                     node,
-                    level: metadata.level.as_str(),
                     thread: self.redactor.redact(metadata.thread),
                     logger: self.redactor.redact(metadata.logger),
                     message: self.redactor.redact(metadata.message),
@@ -818,11 +976,12 @@ impl Analyzer {
                     source_offsets: metadata.offsets,
                 },
             )?;
+            self.last_record_at.insert(group_id, now);
             vec![DomainChange::Created { group_id, count: 1 }]
         };
         let mut emitted = changes;
         emitted.extend(self.apply_merges(&outcome));
-        self.emit_domain_changes(&emitted, out)
+        self.emit_domain_changes(&emitted, now, out)
     }
 
     fn record_overflow(
@@ -904,6 +1063,8 @@ impl Analyzer {
             let removed_id = drop.id;
             self.samples.merge(keep.id, removed_id);
             self.removed.insert(removed_id);
+            self.dirty.remove(&removed_id);
+            self.last_record_at.remove(&removed_id);
             let aggregate = self.aggregate(&keep);
             self.groups.insert(survivor_key, keep);
             changes.push(DomainChange::Merged {
@@ -1018,8 +1179,9 @@ impl Analyzer {
     }
 
     fn emit_domain_changes(
-        &self,
+        &mut self,
         changes: &[DomainChange],
+        now: Instant,
         out: &mut impl Write,
     ) -> Result<(), Error> {
         let merged = changes
@@ -1028,25 +1190,20 @@ impl Analyzer {
         for change in changes {
             match change {
                 DomainChange::Created { .. } => {}
-                DomainChange::Updated { group_id, count } => {
+                DomainChange::Updated { group_id, .. } => {
                     if merged || self.removed.contains(group_id) {
                         continue;
                     }
-                    emit(
-                        out,
-                        &Record::GroupUpdated {
-                            version: 1,
-                            session_id: &self.session_id,
-                            emitted_at: now_utc(),
-                            group_id: *group_id,
-                            count: *count,
-                        },
-                    )?;
+                    self.note_update(*group_id, now, out)?;
                 }
                 DomainChange::Merged {
                     removed_id,
                     survivor,
                 } => {
+                    let Some(group) = self.group_by_id(survivor.id) else {
+                        continue;
+                    };
+                    let (fast_rate, baseline_rate) = rounded_rates(group, &self.rate_params);
                     emit(
                         out,
                         &Record::GroupMerged {
@@ -1061,13 +1218,140 @@ impl Analyzer {
                             template: survivor.template.join(" "),
                             nodes: survivor.nodes.clone(),
                             muted: survivor.muted,
+                            level: survivor.level.as_str(),
                             sample: survivor.sample.clone(),
+                            sample_truncated: survivor.sample_truncated,
+                            fast_rate,
+                            baseline_rate,
                         },
                     )?;
+                    self.dirty.remove(&survivor.id);
+                    self.last_record_at.insert(survivor.id, now);
                 }
             }
         }
         Ok(())
+    }
+
+    fn note_update(
+        &mut self,
+        group_id: u64,
+        now: Instant,
+        out: &mut impl Write,
+    ) -> Result<(), Error> {
+        if self.can_emit_update(group_id, now) {
+            self.emit_group_updated(group_id, now, out)
+        } else {
+            self.dirty.insert(group_id);
+            Ok(())
+        }
+    }
+
+    fn can_emit_update(&self, group_id: u64, now: Instant) -> bool {
+        match self.last_record_at.get(&group_id) {
+            None => true,
+            Some(last) => now.duration_since(*last) >= UPDATE_COALESCE,
+        }
+    }
+
+    fn emit_group_updated(
+        &mut self,
+        group_id: u64,
+        now: Instant,
+        out: &mut impl Write,
+    ) -> Result<(), Error> {
+        let Some(group) = self.group_by_id(group_id) else {
+            self.dirty.remove(&group_id);
+            return Ok(());
+        };
+        let (fast_rate, baseline_rate) = rounded_rates(group, &self.rate_params);
+        let count = group.count;
+        let first_seen = time::rfc3339_millis(group.first_seen);
+        let last_seen = time::rfc3339_millis(group.latest_effective);
+        let template = self.template_text(&group.bucket, group.index);
+        let nodes: Vec<String> = group.nodes.ids().cloned().collect();
+        let muted = group.muted;
+        let level = group.bucket.level.as_str();
+        emit(
+            out,
+            &Record::GroupUpdated {
+                version: 1,
+                session_id: &self.session_id,
+                emitted_at: now_utc(),
+                group_id,
+                count,
+                first_seen,
+                last_seen,
+                template,
+                nodes,
+                muted,
+                level,
+                fast_rate,
+                baseline_rate,
+            },
+        )?;
+        self.dirty.remove(&group_id);
+        self.last_record_at.insert(group_id, now);
+        Ok(())
+    }
+
+    fn flush_due_updates(&mut self, now: Instant, out: &mut impl Write) -> Result<(), Error> {
+        let mut due: Vec<u64> = self
+            .dirty
+            .iter()
+            .copied()
+            .filter(|id| self.can_emit_update(*id, now))
+            .collect();
+        due.sort_unstable();
+        for group_id in due {
+            self.emit_group_updated(group_id, now, out)?;
+        }
+        Ok(())
+    }
+
+    fn flush_pending_updates(&mut self, now: Instant, out: &mut impl Write) -> Result<(), Error> {
+        let mut pending: Vec<u64> = self.dirty.iter().copied().collect();
+        pending.sort_unstable();
+        for group_id in pending {
+            self.emit_group_updated(group_id, now, out)?;
+        }
+        Ok(())
+    }
+
+    fn emit_parser_error(
+        &self,
+        diag: &frame::Diagnostic,
+        out: &mut impl Write,
+    ) -> Result<(), Error> {
+        let redacted = self.redactor.redact_sample(&diag.sample, self.raw_sample);
+        let sample_truncated = redacted.len() > self.sample_max_bytes;
+        emit(
+            out,
+            &Record::ParserError {
+                version: 1,
+                session_id: &self.session_id,
+                emitted_at: now_utc(),
+                reason: diag.reason.as_str(),
+                count: diag.count,
+                sample: frame::bound_sample(&redacted, self.sample_max_bytes),
+                sample_truncated,
+                line: diag.line,
+                offset: diag.offset,
+            },
+        )
+    }
+
+    fn group_by_id(&self, group_id: u64) -> Option<&Group> {
+        self.groups
+            .values()
+            .find(|group| group.id == group_id && !self.removed.contains(&group.id))
+    }
+
+    fn template_text(&self, bucket: &BucketKey, index: usize) -> String {
+        self.templates
+            .template(bucket, index)
+            .unwrap_or(&[])
+            .join(" ")
     }
 
     #[cfg(test)]
@@ -1137,7 +1421,13 @@ impl Analyzer {
         self.samples.budget()
     }
 
-    fn emit_source_ended(&self, status: Option<i32>, out: &mut impl Write) -> Result<(), Error> {
+    fn emit_source_ended(
+        &self,
+        status: Option<i32>,
+        stderr: String,
+        stderr_truncated: bool,
+        out: &mut impl Write,
+    ) -> Result<(), Error> {
         emit(
             out,
             &Record::SourceEnded {
@@ -1145,20 +1435,52 @@ impl Analyzer {
                 session_id: &self.session_id,
                 emitted_at: now_utc(),
                 status,
+                stderr,
+                stderr_truncated,
             },
         )
     }
 }
 
 fn emit(out: &mut impl Write, record: &Record<'_>) -> Result<(), Error> {
-    serde_json::to_writer(&mut *out, record).map_err(|err| Error::Io(err.to_string()))?;
-    out.write_all(b"\n")
+    let mut line = serde_json::to_vec(record).map_err(|err| Error::Io(err.to_string()))?;
+    line.push(b'\n');
+    out.write_all(&line)
         .and_then(|_| out.flush())
-        .map_err(|err| Error::Io(err.to_string()))
+        .map_err(|err| {
+            if err.kind() == std::io::ErrorKind::BrokenPipe {
+                Error::Io("broken stdout".into())
+            } else {
+                Error::Io(err.to_string())
+            }
+        })
 }
 
 fn now_utc() -> String {
     time::rfc3339_millis(Utc::now())
+}
+
+fn is_broken_pipe(err: &Error) -> bool {
+    matches!(
+        err,
+        Error::Io(message)
+            if message.contains("Broken pipe")
+                || message.contains("broken stdout")
+                || message.contains("os error 32")
+    )
+}
+
+fn round_rate(value: f64) -> f64 {
+    if !value.is_finite() {
+        0.0
+    } else {
+        (value * 1000.0).round() / 1000.0
+    }
+}
+
+fn rounded_rates(group: &Group, params: &RateParams) -> (f64, f64) {
+    let (fast, baseline) = group.rate.rates_at(group.latest_effective, params);
+    (round_rate(fast), round_rate(baseline))
 }
 
 #[cfg(test)]
@@ -1219,9 +1541,16 @@ mod tests {
         let mut buf = Vec::new();
         analyzer.emit_session_started(&request(), &mut buf).unwrap();
         for line in lines {
-            analyzer.ingest(line, arrival(), &mut buf).unwrap();
+            analyzer
+                .ingest(line, arrival(), Instant::now(), &mut buf)
+                .unwrap();
         }
-        analyzer.emit_source_ended(Some(0), &mut buf).unwrap();
+        analyzer
+            .flush_pending_updates(Instant::now(), &mut buf)
+            .unwrap();
+        analyzer
+            .emit_source_ended(Some(0), String::new(), false, &mut buf)
+            .unwrap();
         parse_records(&buf)
     }
 
@@ -1259,7 +1588,11 @@ mod tests {
         );
         assert_eq!(recs[1]["count"], 1);
         assert_eq!(recs[1]["sample"], event);
+        assert_eq!(recs[1]["sample_truncated"], false);
         assert_eq!(recs[2]["count"], 2);
+        assert!(recs[2].get("sample").is_none());
+        assert!(recs[1]["fast_rate"].as_f64().unwrap().is_finite());
+        assert!(recs[2]["baseline_rate"].as_f64().unwrap().is_finite());
     }
 
     #[test]
@@ -1285,20 +1618,20 @@ mod tests {
             [
                 "session_started",
                 "group_created",
-                "group_updated",
                 "group_created",
+                "group_updated",
                 "source_ended"
             ]
         );
         assert_eq!(recs[1]["group_id"], 1);
         assert_eq!(recs[1]["count"], 1);
         assert_eq!(recs[1]["sample"], ERROR_A);
-        assert_eq!(recs[2]["group_id"], 1);
-        assert_eq!(recs[2]["count"], 2);
-        assert!(recs[2].get("sample").is_none());
-        assert_eq!(recs[3]["group_id"], 2);
-        assert_eq!(recs[3]["count"], 1);
-        assert_eq!(recs[1]["session_id"], recs[2]["session_id"]);
+        assert_eq!(recs[2]["group_id"], 2);
+        assert_eq!(recs[2]["count"], 1);
+        assert_eq!(recs[3]["group_id"], 1);
+        assert_eq!(recs[3]["count"], 2);
+        assert!(recs[3].get("sample").is_none());
+        assert_eq!(recs[1]["session_id"], recs[3]["session_id"]);
     }
 
     #[test]
@@ -1352,12 +1685,29 @@ mod tests {
             &mut buf,
         )
         .unwrap();
-        analyzer.emit_source_ended(Some(0), &mut buf).unwrap();
+        analyzer
+            .emit_source_ended(Some(0), String::new(), false, &mut buf)
+            .unwrap();
         let recs = parse_records(&buf);
         let types: Vec<&str> = recs.iter().map(|r| r["type"].as_str().unwrap()).collect();
-        assert_eq!(types, ["session_started", "group_created", "source_ended"]);
-        assert_eq!(recs[1]["sample"], ERROR_A);
-        assert_eq!(recs[1]["count"], 1);
+        assert_eq!(
+            types,
+            [
+                "session_started",
+                "parser_error",
+                "parser_error",
+                "group_created",
+                "parser_error",
+                "source_ended"
+            ]
+        );
+        assert_eq!(recs[1]["reason"], "unframed_prefix");
+        assert_eq!(recs[1]["count"], 7);
+        assert_eq!(recs[1]["sample"], "garbage");
+        assert_eq!(recs[2]["reason"], "event_byte_limit");
+        assert_eq!(recs[3]["sample"], ERROR_A);
+        assert_eq!(recs[3]["count"], 1);
+        assert_eq!(recs[4]["reason"], "invalid_utf8");
         assert_eq!(analyzer.groups.len(), 1);
         assert_eq!(analyzer.diagnostics, 48);
         assert_eq!(analyzer.selected_events, 1);
@@ -1381,6 +1731,7 @@ mod tests {
             .ingest(
                 "26.08.2026 12:00:00.000 author-0 *ERROR* [t] com.example.Foo alpha beta gamma delta epsilon",
                 arrival(),
+                Instant::now(),
                 &mut buf,
             )
             .unwrap();
@@ -1388,6 +1739,7 @@ mod tests {
             .ingest(
                 "26.08.2026 12:00:01.000 author-1 *ERROR* [t] com.example.Foo zzzzz yyyyy xxxxx wwwww vvvvv",
                 arrival(),
+                Instant::now(),
                 &mut buf,
             )
             .unwrap();
@@ -1395,6 +1747,7 @@ mod tests {
             .ingest(
                 "26.08.2026 12:00:02.000 author-0 *ERROR* [t] com.example.Foo alpha beta gamma delta epsilon",
                 arrival(),
+                Instant::now(),
                 &mut buf,
             )
             .unwrap();
@@ -1429,7 +1782,9 @@ mod tests {
             &tuning,
         );
         let mut buf = Vec::new();
-        analyzer.ingest(event, arrival(), &mut buf).unwrap();
+        analyzer
+            .ingest(event, arrival(), Instant::now(), &mut buf)
+            .unwrap();
         let record = parse_records(&buf).pop().expect("group record");
         assert_eq!(record["timestamp"], "2026-08-26T12:00:00.123Z");
         assert!(record.get("time_fallback").is_none());
@@ -1445,6 +1800,7 @@ mod tests {
         assert!(record["terminal_exception"].is_null());
         assert!(record["terminal_frame"].is_null());
         assert!(record["sample"].as_str().unwrap().len() <= 24);
+        assert_eq!(record["sample_truncated"], true);
         assert!(record["source_offsets"]["logger"]["end"].as_u64().unwrap() > 0);
     }
 
@@ -1466,6 +1822,8 @@ mod tests {
         assert_eq!(recs[1]["group_id"], 1);
         assert_eq!(recs[2]["group_id"], 1);
         assert_eq!(recs[2]["count"], 2);
+        assert_eq!(recs[1]["first_seen"], "2026-08-26T12:00:00.123Z");
+        assert_eq!(recs[2]["last_seen"], "2026-08-26T12:00:01.000Z");
         let sample = recs[1]["sample"].as_str().unwrap();
         assert!(!sample.contains("ops@example.com"), "{sample}");
         assert!(sample.contains("[REDACTED:email]"), "{sample}");
@@ -1488,16 +1846,17 @@ mod tests {
             [
                 "session_started",
                 "group_created",
-                "group_updated",
                 "group_created",
+                "group_updated",
                 "source_ended"
             ]
         );
         assert_eq!(recs[1]["group_id"], 1);
-        assert_eq!(recs[2]["group_id"], 1);
-        assert_eq!(recs[3]["group_id"], 2);
-        assert_eq!(recs[3]["terminal_exception"], "java.lang.RuntimeException");
-        assert_eq!(recs[3]["terminal_frame"], "com.example.Foo.bar");
+        assert_eq!(recs[2]["group_id"], 2);
+        assert_eq!(recs[2]["terminal_exception"], "java.lang.RuntimeException");
+        assert_eq!(recs[2]["terminal_frame"], "com.example.Foo.bar");
+        assert_eq!(recs[3]["group_id"], 1);
+        assert_eq!(recs[3]["count"], 2);
     }
 
     #[test]
@@ -1568,7 +1927,9 @@ mod tests {
             &tuning,
         );
         let mut buf = Vec::new();
-        analyzer.ingest(&event, arrival(), &mut buf).unwrap();
+        analyzer
+            .ingest(&event, arrival(), Instant::now(), &mut buf)
+            .unwrap();
         let record = parse_records(&buf).pop().expect("group record");
         let sample = record["sample"].as_str().unwrap();
         assert!(sample.len() <= max, "{sample}");
@@ -1605,7 +1966,9 @@ mod tests {
             &tuning,
         );
         let mut buf = Vec::new();
-        analyzer.ingest(ERROR_A, arrival(), &mut buf).unwrap();
+        analyzer
+            .ingest(ERROR_A, arrival(), Instant::now(), &mut buf)
+            .unwrap();
         let record = parse_records(&buf).pop().expect("group record");
         assert_eq!(record["timestamp"], "2026-08-26T16:00:00.123Z");
         assert!(record.get("time_fallback").is_none());
@@ -1629,8 +1992,12 @@ mod tests {
         let fold =
             "01.11.2026 01:30:00.000 author-0 *ERROR* [FelixDispatchQueue] com.example.Bar fall";
         let mut buf = Vec::new();
-        analyzer.ingest(gap, arrival(), &mut buf).unwrap();
-        analyzer.ingest(fold, arrival(), &mut buf).unwrap();
+        analyzer
+            .ingest(gap, arrival(), Instant::now(), &mut buf)
+            .unwrap();
+        analyzer
+            .ingest(fold, arrival(), Instant::now(), &mut buf)
+            .unwrap();
         let recs = parse_records(&buf);
         assert_eq!(recs[0]["timestamp"], "2026-08-26T20:00:00.000Z");
         assert_eq!(recs[0]["time_fallback"], true);
@@ -1644,8 +2011,12 @@ mod tests {
         let later = "26.08.2026 12:00:02.000 author-0 *ERROR* [FelixDispatchQueue] com.example.Foo Failed to start bundle";
         let earlier = "26.08.2026 12:00:01.000 author-1 *ERROR* [FelixDispatchQueue] com.example.Foo Failed to start bundle";
         let mut buf = Vec::new();
-        analyzer.ingest(later, arrival(), &mut buf).unwrap();
-        analyzer.ingest(earlier, arrival(), &mut buf).unwrap();
+        analyzer
+            .ingest(later, arrival(), Instant::now(), &mut buf)
+            .unwrap();
+        analyzer
+            .ingest(earlier, arrival(), Instant::now(), &mut buf)
+            .unwrap();
         let first = Utc.with_ymd_and_hms(2026, 8, 26, 12, 0, 2).unwrap();
         assert_eq!(
             analyzer.groups.values().next().unwrap().latest_effective,
@@ -1699,19 +2070,25 @@ mod tests {
             [
                 "session_started",
                 "group_created",
-                "group_updated",
+                "group_created",
                 "group_created",
                 "group_updated",
-                "group_created",
+                "group_updated",
                 "source_ended"
             ]
         );
         assert_eq!(recs[1]["group_id"], 1);
-        assert_eq!(recs[2]["group_id"], 1);
-        assert_eq!(recs[3]["group_id"], 2);
-        assert_eq!(recs[4]["group_id"], 2);
-        assert_eq!(recs[5]["group_id"], 3);
-        assert_eq!(recs[5]["terminal_frame"], "com.example.Foo.bar");
+        assert_eq!(recs[2]["group_id"], 2);
+        assert_eq!(recs[3]["group_id"], 3);
+        assert_eq!(recs[3]["terminal_frame"], "com.example.Foo.bar");
+        let updates: Vec<_> = recs
+            .iter()
+            .filter(|r| r["type"] == "group_updated")
+            .collect();
+        assert_eq!(updates[0]["group_id"], 1);
+        assert_eq!(updates[0]["count"], 2);
+        assert_eq!(updates[1]["group_id"], 2);
+        assert_eq!(updates[1]["count"], 2);
     }
 
     fn merge_bridge_lines() -> Vec<String> {
@@ -1741,12 +2118,21 @@ mod tests {
         let mut analyzer = Analyzer::new(vec![Level::Error]);
         let mut buf = Vec::new();
         analyzer.emit_session_started(&request(), &mut buf).unwrap();
-        analyzer.ingest(refs[0], arrival(), &mut buf).unwrap();
+        analyzer
+            .ingest(refs[0], arrival(), Instant::now(), &mut buf)
+            .unwrap();
         analyzer.mute(1);
         for line in &refs[1..] {
-            analyzer.ingest(line, arrival(), &mut buf).unwrap();
+            analyzer
+                .ingest(line, arrival(), Instant::now(), &mut buf)
+                .unwrap();
         }
-        analyzer.emit_source_ended(Some(0), &mut buf).unwrap();
+        analyzer
+            .flush_pending_updates(Instant::now(), &mut buf)
+            .unwrap();
+        analyzer
+            .emit_source_ended(Some(0), String::new(), false, &mut buf)
+            .unwrap();
         let recs = parse_records(&buf);
         let merged = recs
             .iter()
@@ -1780,14 +2166,21 @@ mod tests {
         let mut analyzer = Analyzer::new(vec![Level::Error]);
         let mut buf = Vec::new();
         for line in &refs {
-            analyzer.ingest(line, arrival(), &mut buf).unwrap();
+            analyzer
+                .ingest(line, arrival(), Instant::now(), &mut buf)
+                .unwrap();
         }
         let after_merge = event(
             "26.08.2026 12:00:05.000",
             "author-3",
             "alpha other unique novel epsilon",
         );
-        analyzer.ingest(&after_merge, arrival(), &mut buf).unwrap();
+        analyzer
+            .ingest(&after_merge, arrival(), Instant::now(), &mut buf)
+            .unwrap();
+        analyzer
+            .flush_pending_updates(Instant::now(), &mut buf)
+            .unwrap();
         let recs = parse_records(&buf);
         let merge_at = recs
             .iter()
@@ -1880,7 +2273,9 @@ mod tests {
         let mut analyzer = Analyzer::new(vec![Level::Error]);
         let mut buf = Vec::new();
         for line in &corpus {
-            analyzer.ingest(line, arrival(), &mut buf).unwrap();
+            analyzer
+                .ingest(line, arrival(), Instant::now(), &mut buf)
+                .unwrap();
         }
         let expected = fingerprint(&analyzer.snapshot_groups());
         let expected_total: u64 = analyzer.snapshot_groups().iter().map(|g| g.count).sum();
@@ -1890,7 +2285,9 @@ mod tests {
             let mut other = Analyzer::new(vec![Level::Error]);
             let mut out = Vec::new();
             for line in &ordered {
-                other.ingest(line, arrival(), &mut out).unwrap();
+                other
+                    .ingest(line, arrival(), Instant::now(), &mut out)
+                    .unwrap();
             }
             assert_eq!(
                 fingerprint(&other.snapshot_groups()),
@@ -1914,6 +2311,7 @@ mod tests {
                     "Failed to start bundle",
                 ),
                 arrival(),
+                Instant::now(),
                 &mut buf,
             )
             .unwrap();
@@ -1925,6 +2323,7 @@ mod tests {
                     "Failed to start bundle",
                 ),
                 arrival(),
+                Instant::now(),
                 &mut buf,
             )
             .unwrap();
@@ -1963,7 +2362,9 @@ mod tests {
         let gap =
             "08.03.2026 02:30:00.000 author-0 *ERROR* [FelixDispatchQueue] com.example.Foo spring";
         let mut buf = Vec::new();
-        analyzer.ingest(gap, arrival(), &mut buf).unwrap();
+        analyzer
+            .ingest(gap, arrival(), Instant::now(), &mut buf)
+            .unwrap();
         let group = analyzer.groups.values().next().unwrap();
         assert_eq!(group.latest_effective, arrival());
         assert_eq!(group.rate.updated_at(), arrival());
@@ -1983,8 +2384,12 @@ mod tests {
             "Failed to start bundle",
         );
         let mut buf = Vec::new();
-        analyzer.ingest(&later, arrival(), &mut buf).unwrap();
-        analyzer.ingest(&earlier, arrival(), &mut buf).unwrap();
+        analyzer
+            .ingest(&later, arrival(), Instant::now(), &mut buf)
+            .unwrap();
+        analyzer
+            .ingest(&earlier, arrival(), Instant::now(), &mut buf)
+            .unwrap();
         let group = analyzer.groups.values().next().unwrap();
         let last = Utc.with_ymd_and_hms(2026, 8, 26, 12, 0, 10).unwrap();
         assert_eq!(group.latest_effective, last);
@@ -2002,7 +2407,9 @@ mod tests {
         let mut analyzer = Analyzer::new(vec![Level::Error]);
         let mut buf = Vec::new();
         for line in &lines {
-            analyzer.ingest(line, arrival(), &mut buf).unwrap();
+            analyzer
+                .ingest(line, arrival(), Instant::now(), &mut buf)
+                .unwrap();
         }
         let snap = analyzer.snapshot_groups();
         assert_eq!(snap.len(), 1);
@@ -2033,6 +2440,7 @@ mod tests {
             .ingest(
                 &event("26.08.2026 12:00:00.000", "author-0", "alpha error"),
                 arrival(),
+                Instant::now(),
                 &mut buf,
             )
             .unwrap();
@@ -2040,6 +2448,7 @@ mod tests {
             .ingest(
                 &event("26.08.2026 12:00:50.000", "author-0", "beta error"),
                 arrival(),
+                Instant::now(),
                 &mut buf,
             )
             .unwrap();
@@ -2095,7 +2504,9 @@ mod tests {
     fn ingest_lines(analyzer: &mut Analyzer, lines: &[String]) {
         let mut buf = Vec::new();
         for line in lines {
-            analyzer.ingest(line, arrival(), &mut buf).unwrap();
+            analyzer
+                .ingest(line, arrival(), Instant::now(), &mut buf)
+                .unwrap();
         }
     }
 
@@ -2309,10 +2720,16 @@ mod tests {
         );
         let mut analyzer = analyzer_samples(u64::MAX, u64::MAX);
         let mut buf = Vec::new();
-        analyzer.ingest(&first, arrival(), &mut buf).unwrap();
+        analyzer
+            .ingest(&first, arrival(), Instant::now(), &mut buf)
+            .unwrap();
         let after_first = analyzer.sample_bytes_used();
-        analyzer.ingest(&again, arrival(), &mut buf).unwrap();
-        analyzer.ingest(&again, arrival(), &mut buf).unwrap();
+        analyzer
+            .ingest(&again, arrival(), Instant::now(), &mut buf)
+            .unwrap();
+        analyzer
+            .ingest(&again, arrival(), Instant::now(), &mut buf)
+            .unwrap();
         let snap = analyzer.snapshot_groups();
         assert_eq!(snap.len(), 1);
         assert_eq!(snap[0].count, 3);
@@ -2344,7 +2761,9 @@ mod tests {
         event.push_str("\tat com.example.Foo.bar(Foo.java:42)\n");
         let mut analyzer = analyzer_samples(200, 200);
         let mut buf = Vec::new();
-        analyzer.ingest(&event, arrival(), &mut buf).unwrap();
+        analyzer
+            .ingest(&event, arrival(), Instant::now(), &mut buf)
+            .unwrap();
         let snap = analyzer.snapshot_groups();
         assert_eq!(snap.len(), 1);
         assert!(snap[0].sample_truncated);
@@ -2419,8 +2838,12 @@ mod tests {
         let hold_one = lines[0].len().max(lines[1].len()) as u64;
         let mut analyzer = analyzer_samples(max_len, hold_one);
         let mut buf = Vec::new();
-        analyzer.ingest(&lines[0], arrival(), &mut buf).unwrap();
-        analyzer.ingest(&lines[1], arrival(), &mut buf).unwrap();
+        analyzer
+            .ingest(&lines[0], arrival(), Instant::now(), &mut buf)
+            .unwrap();
+        analyzer
+            .ingest(&lines[1], arrival(), Instant::now(), &mut buf)
+            .unwrap();
         let mid = analyzer.snapshot_groups();
         assert_eq!(mid.len(), 2);
         let older = mid.iter().find(|group| group.id == 1).unwrap();
@@ -2428,7 +2851,9 @@ mod tests {
         assert!(!older.sample_available);
         assert!(newer.sample_available);
         for line in &lines[2..] {
-            analyzer.ingest(line, arrival(), &mut buf).unwrap();
+            analyzer
+                .ingest(line, arrival(), Instant::now(), &mut buf)
+                .unwrap();
         }
         let snap = analyzer.snapshot_groups();
         assert_eq!(snap.len(), 1);
@@ -2449,7 +2874,9 @@ mod tests {
                 &format!("author-{i}"),
                 "Failed to start bundle",
             );
-            analyzer.ingest(&line, arrival(), &mut buf).unwrap();
+            analyzer
+                .ingest(&line, arrival(), Instant::now(), &mut buf)
+                .unwrap();
         }
         let snap = analyzer.snapshot_groups();
         assert_eq!(snap.len(), 1);
@@ -2466,6 +2893,91 @@ mod tests {
             .nodes
             .iter()
             .any(|id| id == &format!("author-{}", evidence::MAX_NODE_IDS)));
+    }
+
+    #[test]
+    fn updates_coalesce_to_one_per_second_without_losing_final_count() {
+        let mut analyzer = Analyzer::new(vec![Level::Error]);
+        let mut buf = Vec::new();
+        let t0 = Instant::now();
+        analyzer.ingest(ERROR_A, arrival(), t0, &mut buf).unwrap();
+        analyzer
+            .ingest(
+                ERROR_A_REPEAT,
+                arrival(),
+                t0 + Duration::from_millis(10),
+                &mut buf,
+            )
+            .unwrap();
+        analyzer
+            .ingest(ERROR_A, arrival(), t0 + Duration::from_millis(20), &mut buf)
+            .unwrap();
+        assert!(parse_records(&buf)
+            .iter()
+            .all(|record| record["type"] != "group_updated"));
+        analyzer
+            .flush_due_updates(t0 + Duration::from_millis(500), &mut buf)
+            .unwrap();
+        assert!(parse_records(&buf)
+            .iter()
+            .all(|record| record["type"] != "group_updated"));
+        analyzer
+            .flush_due_updates(t0 + Duration::from_secs(1), &mut buf)
+            .unwrap();
+        let updates: Vec<_> = parse_records(&buf)
+            .into_iter()
+            .filter(|record| record["type"] == "group_updated")
+            .collect();
+        assert_eq!(updates.len(), 1);
+        assert_eq!(updates[0]["count"], 3);
+        assert_eq!(updates[0]["group_id"], 1);
+        assert!(updates[0].get("sample").is_none());
+        assert!(updates[0]["fast_rate"].as_f64().unwrap().is_finite());
+    }
+
+    #[test]
+    fn source_end_flushes_coalesced_final_count() {
+        let mut analyzer = Analyzer::new(vec![Level::Error]);
+        let mut buf = Vec::new();
+        let t0 = Instant::now();
+        analyzer.ingest(ERROR_A, arrival(), t0, &mut buf).unwrap();
+        analyzer
+            .ingest(
+                ERROR_A_REPEAT,
+                arrival(),
+                t0 + Duration::from_millis(1),
+                &mut buf,
+            )
+            .unwrap();
+        analyzer
+            .flush_pending_updates(t0 + Duration::from_millis(2), &mut buf)
+            .unwrap();
+        let updates: Vec<_> = parse_records(&buf)
+            .into_iter()
+            .filter(|record| record["type"] == "group_updated")
+            .collect();
+        assert_eq!(updates.len(), 1);
+        assert_eq!(updates[0]["count"], 2);
+    }
+
+    #[test]
+    fn stderr_tail_keeps_last_64kib_and_marks_truncation() {
+        let mut tail = StderrTail::new();
+        tail.push(&[b'a'; STDERR_TAIL]);
+        let (text, truncated) = tail.snapshot();
+        assert_eq!(text.len(), STDERR_TAIL);
+        assert!(!truncated);
+        tail.push(b"xyz");
+        let (text, truncated) = tail.snapshot();
+        assert_eq!(text.len(), STDERR_TAIL);
+        assert!(truncated);
+        assert!(text.ends_with("xyz"));
+        let mut huge = StderrTail::new();
+        huge.push(&[b'b'; STDERR_TAIL + 8]);
+        let (text, truncated) = huge.snapshot();
+        assert_eq!(text.len(), STDERR_TAIL);
+        assert!(truncated);
+        assert!(text.chars().all(|ch| ch == 'b'));
     }
 
     fn is_uuid_v4(id: &str) -> bool {

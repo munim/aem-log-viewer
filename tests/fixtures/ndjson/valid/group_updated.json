@@ -1,0 +1,16 @@
+{
+  "version": 1,
+  "type": "group_updated",
+  "session_id": "550e8400-e29b-41d4-a716-446655440000",
+  "emitted_at": "2026-08-26T12:00:01.000Z",
+  "group_id": 1,
+  "count": 4,
+  "first_seen": "2026-08-26T12:00:00.123Z",
+  "last_seen": "2026-08-26T12:00:00.900Z",
+  "template": "Failed to start bundle",
+  "nodes": ["author-0", "author-1"],
+  "muted": false,
+  "level": "ERROR",
+  "fast_rate": 1.250,
+  "baseline_rate": 0.013
+}
