@@ -1,4 +1,5 @@
 mod cli;
+mod config;
 mod error;
 mod live;
 mod source;
@@ -8,14 +9,17 @@ use std::io::IsTerminal;
 use clap::Parser;
 
 use cli::RawArgs;
+use config::SearchRoots;
 pub(crate) use error::Error;
 
 pub(crate) fn run() -> Result<(), Error> {
-    execute(RawArgs::parse())
+    execute(RawArgs::parse(), SearchRoots::from_process())
 }
 
-fn execute(raw: RawArgs) -> Result<(), Error> {
-    let request = cli::Request::try_from(raw)?;
+fn execute(raw: RawArgs, roots: SearchRoots) -> Result<(), Error> {
+    let input = cli::CliInput::try_from(raw)?;
+    let loaded = config::load(input.config.as_deref(), &roots)?;
+    let request = config::resolve(input, loaded)?;
     if !request.json && !std::io::stdout().is_terminal() {
         return Err(Error::NonTty);
     }
@@ -46,8 +50,7 @@ mod tests {
             "author",
             "--json",
         ]);
-        let request = cli::Request::try_from(raw).expect("accepted json invocation");
-        assert!(request.json);
+        execute(raw, SearchRoots::default()).expect("accepted json invocation");
     }
 
     #[test]
@@ -61,7 +64,7 @@ mod tests {
             "--service",
             "publish",
         ]);
-        match execute(raw) {
+        match execute(raw, SearchRoots::default()) {
             Err(Error::NonTty) => {}
             other => panic!("expected NonTty, got {other:?}"),
         }
