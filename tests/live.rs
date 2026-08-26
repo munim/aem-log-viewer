@@ -733,3 +733,243 @@ fn ctrl_c_sigkills_term_resistant_descendant() {
     assert!(!pid_alive(aio_pid), "aio orphaned after forced kill");
     assert!(!pid_alive(descendant), "term-resistant descendant orphaned");
 }
+
+#[cfg(unix)]
+#[test]
+fn pty_volume_updates_and_q_restores_terminal() {
+    use std::os::fd::AsRawFd;
+    use std::os::unix::io::FromRawFd;
+    use std::os::unix::process::CommandExt;
+
+    let fake = FakeAio::install();
+    fs::write(
+        &fake.logs,
+        "\
+26.08.2026 12:00:00.123 author-0 *ERROR* [FelixDispatchQueue] com.example.Foo Failed to start bundle
+26.08.2026 12:00:00.456 author-0 *ERROR* [FelixDispatchQueue] com.example.Foo Failed to start bundle
+26.08.2026 12:00:01.001 author-0 *ERROR* [FelixDispatchQueue] com.example.Baz other error
+",
+    )
+    .expect("logs");
+
+    let mut master = posix_openpt().expect("posix_openpt");
+    unlockpt(master.as_raw_fd()).expect("unlockpt");
+    let slave_path = ptsname(master.as_raw_fd()).expect("ptsname");
+    let slave = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&slave_path)
+        .expect("open slave");
+    set_window(master.as_raw_fd(), 120, 40);
+    let slave_fd = slave.as_raw_fd();
+    let stdin_fd = unsafe { libc::dup(slave_fd) };
+    let stdout_fd = unsafe { libc::dup(slave_fd) };
+    assert!(stdin_fd >= 0 && stdout_fd >= 0, "dup slave");
+
+    let mut cmd = aemlog();
+    cmd.args([
+        "--program-id",
+        "p1",
+        "--environment-id",
+        "e1",
+        "--service",
+        "author",
+    ])
+    .env_clear()
+    .env("PATH", fake.path())
+    .env("HOME", &fake.dir)
+    .env("TERM", "xterm")
+    .env("AEMLOG_FAKE_AIO_RECORD", &fake.record)
+    .env("AEMLOG_FAKE_AIO_LOGS", &fake.logs)
+    .env("AEMLOG_FAKE_AIO_HOLD", "1")
+    .stdin(unsafe { Stdio::from_raw_fd(stdin_fd) })
+    .stdout(unsafe { Stdio::from_raw_fd(stdout_fd) })
+    .stderr(Stdio::piped());
+    let mut child = unsafe {
+        cmd.pre_exec(|| {
+            libc::setsid();
+            libc::ioctl(0, libc::TIOCSCTTY as libc::c_ulong, 0);
+            Ok(())
+        })
+        .spawn()
+        .expect("spawn aemlog on pty")
+    };
+    drop(slave);
+
+    let screen = wait_for_screen(&mut master, |text| text.contains("Failed to start bundle"));
+    assert!(screen.contains("Volume"), "{screen}");
+    assert!(
+        screen.contains("COUNT") || screen.contains("Failed"),
+        "{screen}"
+    );
+    assert!(
+        !screen.contains("Connected"),
+        "process state leaked Connected\n{screen}"
+    );
+
+    write_all(&mut master, b"j");
+    write_all(&mut master, b"q");
+    let leftover = wait_exit_draining(&mut child, &mut master, Duration::from_secs(5));
+    assert!(
+        leftover.contains("[?1049l") || leftover.contains("1049l"),
+        "alternate screen not left\n{leftover:?}"
+    );
+}
+
+#[cfg(unix)]
+fn posix_openpt() -> std::io::Result<std::fs::File> {
+    use std::os::fd::FromRawFd;
+    let fd = unsafe { libc::posix_openpt(libc::O_RDWR | libc::O_NOCTTY) };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    if unsafe { libc::grantpt(fd) } != 0 {
+        let err = std::io::Error::last_os_error();
+        unsafe { libc::close(fd) };
+        return Err(err);
+    }
+    Ok(unsafe { std::fs::File::from_raw_fd(fd) })
+}
+
+#[cfg(unix)]
+fn unlockpt(fd: i32) -> std::io::Result<()> {
+    if unsafe { libc::unlockpt(fd) } != 0 {
+        Err(std::io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(unix)]
+fn ptsname(fd: i32) -> std::io::Result<String> {
+    let ptr = unsafe { libc::ptsname(fd) };
+    if ptr.is_null() {
+        return Err(std::io::Error::last_os_error());
+    }
+    let cstr = unsafe { std::ffi::CStr::from_ptr(ptr) };
+    Ok(cstr.to_string_lossy().into_owned())
+}
+
+#[cfg(unix)]
+fn set_window(fd: i32, cols: u16, rows: u16) {
+    let mut size = libc::winsize {
+        ws_row: rows,
+        ws_col: cols,
+        ws_xpixel: 0,
+        ws_ypixel: 0,
+    };
+    unsafe {
+        libc::ioctl(fd, libc::TIOCSWINSZ, &mut size);
+    }
+}
+
+#[cfg(unix)]
+fn write_all(file: &mut std::fs::File, bytes: &[u8]) {
+    file.write_all(bytes).expect("write pty");
+    let _ = file.flush();
+}
+
+#[cfg(unix)]
+fn drain(file: &mut std::fs::File) -> String {
+    use std::os::fd::AsRawFd;
+    let mut buf = [0u8; 8192];
+    let mut out = Vec::new();
+    set_nonblocking(file.as_raw_fd());
+    loop {
+        match file.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => out.extend_from_slice(&buf[..n]),
+            Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => break,
+            Err(_) => break,
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+#[cfg(unix)]
+fn wait_for_screen(file: &mut std::fs::File, pred: impl Fn(&str) -> bool) -> String {
+    let deadline = Instant::now() + Duration::from_secs(4);
+    let mut acc = String::new();
+    while Instant::now() < deadline {
+        acc.push_str(&drain(file));
+        let visible = strip_ansi(&acc);
+        if pred(&visible) || pred(&acc) {
+            return visible;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    panic!("pty screen never matched; last={acc:?}");
+}
+
+#[cfg(unix)]
+fn strip_ansi(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch != '\u{1b}' {
+            out.push(ch);
+            continue;
+        }
+        match chars.peek() {
+            Some('[') => {
+                chars.next();
+                for next in chars.by_ref() {
+                    if next.is_ascii_alphabetic() {
+                        break;
+                    }
+                }
+            }
+            Some(']') => {
+                chars.next();
+                for next in chars.by_ref() {
+                    if next == '\u{7}' {
+                        break;
+                    }
+                }
+            }
+            Some(_) => {
+                chars.next();
+            }
+            None => {}
+        }
+    }
+    out
+}
+
+#[cfg(unix)]
+fn set_nonblocking(fd: i32) {
+    unsafe {
+        let flags = libc::fcntl(fd, libc::F_GETFL);
+        if flags >= 0 {
+            libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK);
+        }
+    }
+}
+
+#[cfg(unix)]
+fn wait_exit_draining(
+    child: &mut std::process::Child,
+    master: &mut std::fs::File,
+    limit: Duration,
+) -> String {
+    let deadline = Instant::now() + limit;
+    let mut leftover = String::new();
+    loop {
+        leftover.push_str(&drain(master));
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                leftover.push_str(&drain(master));
+                assert_eq!(status.code(), Some(0), "aemlog status {status}");
+                return leftover;
+            }
+            Ok(None) if Instant::now() >= deadline => {
+                let _ = child.kill();
+                let _ = child.wait();
+                leftover.push_str(&drain(master));
+                panic!("aemlog did not exit after q; leftover={leftover:?}");
+            }
+            Ok(None) => std::thread::sleep(Duration::from_millis(20)),
+            Err(err) => panic!("wait child: {err}"),
+        }
+    }
+}
