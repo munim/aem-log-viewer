@@ -1,3 +1,4 @@
+use std::path::PathBuf;
 use std::process::ExitCode;
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
@@ -10,6 +11,14 @@ pub(crate) enum Error {
     EmptyImsContext,
     #[error("config path must be a non-empty string")]
     EmptyConfig,
+    #[error("config file not found: {}", .0.display())]
+    ConfigNotFound(PathBuf),
+    #[error("config path is not a regular file: {}", .0.display())]
+    ConfigNotRegular(PathBuf),
+    #[error("config file is unreadable: {}: {message}", path.display())]
+    ConfigUnreadable { path: PathBuf, message: String },
+    #[error("invalid config file {}: {message}", path.display())]
+    ConfigInvalid { path: PathBuf, message: String },
     #[error("at least one --level is required")]
     EmptyLevels,
     #[error("invalid timezone '{0}': expected utc, local, or an IANA timezone name")]
@@ -53,6 +62,18 @@ mod tests {
         assert_eq!(Error::EmptyProgramId.exit_code(), ExitCode::from(2));
         assert_eq!(
             Error::InvalidTimezone("x".into()).exit_code(),
+            ExitCode::from(2)
+        );
+        assert_eq!(
+            Error::ConfigNotFound(std::path::PathBuf::from("missing.toml")).exit_code(),
+            ExitCode::from(2)
+        );
+        assert_eq!(
+            Error::ConfigInvalid {
+                path: PathBuf::from("bad.toml"),
+                message: "x".into(),
+            }
+            .exit_code(),
             ExitCode::from(2)
         );
         assert_eq!(

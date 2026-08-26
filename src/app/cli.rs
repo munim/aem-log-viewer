@@ -18,8 +18,10 @@ duplicates are dropped; the default effective level is ERROR.
 --service accepts Author or Publish, case-insensitively.
 
 Invalid program, environment, service, level, timezone, or output-flag combinations
-fail before any AIO process starts. Internal startup failures exit with status 1;
-invalid CLI input exits with status 2.
+fail before any AIO process starts. Without --config, the first existing regular file
+among ~/aemlog.toml, ~/.config/aemlog/config.toml, executable-directory aemlog.toml,
+and working-directory aemlog.toml is loaded once. Files are never merged. Internal
+startup failures exit with status 1; invalid CLI input exits with status 2.
 ";
 
 #[derive(Debug, Parser)]
@@ -56,26 +58,20 @@ pub(super) struct RawArgs {
     service: Service,
 
     /// Log levels to select. Repeatable. Default: ERROR
-    #[arg(
-        long,
-        value_enum,
-        ignore_case = true,
-        default_values_t = [Level::Error],
-        value_name = "LEVEL"
-    )]
+    #[arg(long, value_enum, ignore_case = true, value_name = "LEVEL")]
     level: Vec<Level>,
 
     /// Adobe IMS context name passed to aio
     #[arg(long = "ims-context", value_name = "CONTEXT")]
     ims_context: Option<String>,
 
-    /// Path to analyzer TOML configuration
+    /// Path to analyzer TOML configuration. Authoritative; skips automatic discovery.
     #[arg(long, value_name = "PATH")]
     config: Option<PathBuf>,
 
     /// Timezone for zone-less source timestamps: utc (default), local, or IANA name
-    #[arg(long, default_value = "utc", value_name = "TIMEZONE")]
-    timezone: String,
+    #[arg(long, value_name = "TIMEZONE")]
+    timezone: Option<String>,
 
     /// Write version-1 NDJSON to stdout instead of starting the TUI
     #[arg(long)]
@@ -112,6 +108,20 @@ pub(super) enum Timezone {
 }
 
 #[derive(Debug, Eq, PartialEq)]
+pub(super) struct CliInput {
+    pub(super) program_id: String,
+    pub(super) environment_id: String,
+    pub(super) service: Service,
+    pub(super) levels: Vec<Level>,
+    pub(super) ims_context: Option<String>,
+    pub(super) config: Option<PathBuf>,
+    pub(super) timezone: Option<Timezone>,
+    pub(super) json: bool,
+    pub(super) raw_sample: bool,
+}
+
+#[derive(Debug, PartialEq)]
+#[allow(dead_code)]
 pub(super) struct Request {
     pub(super) program_id: String,
     pub(super) environment_id: String,
@@ -122,6 +132,7 @@ pub(super) struct Request {
     pub(super) timezone: Timezone,
     pub(super) json: bool,
     pub(super) raw_sample: bool,
+    pub(super) loaded: Option<toml::Table>,
 }
 
 impl Service {
@@ -158,7 +169,7 @@ impl Level {
     }
 }
 
-impl TryFrom<RawArgs> for Request {
+impl TryFrom<RawArgs> for CliInput {
     type Error = Error;
 
     fn try_from(raw: RawArgs) -> Result<Self, Error> {
@@ -175,18 +186,18 @@ impl TryFrom<RawArgs> for Request {
         if raw.raw_sample && !raw.json {
             return Err(Error::RawSampleWithoutJson);
         }
-        let levels = dedupe(raw.level);
-        if levels.is_empty() {
-            return Err(Error::EmptyLevels);
-        }
+        let timezone = match raw.timezone {
+            Some(value) => Some(Timezone::parse(&value)?),
+            None => None,
+        };
         Ok(Self {
             program_id,
             environment_id,
             service: raw.service,
-            levels,
+            levels: raw.level,
             ims_context,
             config,
-            timezone: Timezone::parse(&raw.timezone)?,
+            timezone,
             json: raw.json,
             raw_sample: raw.raw_sample,
         })
@@ -194,7 +205,7 @@ impl TryFrom<RawArgs> for Request {
 }
 
 impl Timezone {
-    fn parse(raw: &str) -> Result<Self, Error> {
+    pub(super) fn parse(raw: &str) -> Result<Self, Error> {
         if raw.trim().is_empty() {
             return Err(Error::InvalidTimezone(raw.to_owned()));
         }
@@ -218,7 +229,7 @@ fn nonempty(value: String, err: Error) -> Result<String, Error> {
     }
 }
 
-fn dedupe(levels: Vec<Level>) -> Vec<Level> {
+pub(super) fn dedupe(levels: Vec<Level>) -> Vec<Level> {
     let mut out = Vec::with_capacity(levels.len());
     for level in levels {
         if !out.contains(&level) {
@@ -234,7 +245,13 @@ mod tests {
 
     fn parse(args: &[&str]) -> Request {
         let raw = RawArgs::try_parse_from(args).expect("parse");
-        Request::try_from(raw).expect("validate")
+        let input = CliInput::try_from(raw).expect("validate");
+        super::super::config::resolve(input, None).expect("resolve")
+    }
+
+    fn parse_input(args: &[&str]) -> CliInput {
+        let raw = RawArgs::try_parse_from(args).expect("parse");
+        CliInput::try_from(raw).expect("validate")
     }
 
     fn parse_err(args: &[&str]) -> Error {
@@ -242,7 +259,7 @@ mod tests {
             Ok(raw) => raw,
             Err(err) => panic!("expected validation error after clap parse, got clap error: {err}"),
         };
-        Request::try_from(raw).expect_err("expected validation error")
+        CliInput::try_from(raw).expect_err("expected validation error")
     }
 
     fn clap_err(args: &[&str]) -> clap::Error {
@@ -270,6 +287,14 @@ mod tests {
         assert!(!request.raw_sample);
         assert_eq!(request.program_id, "p1");
         assert_eq!(request.environment_id, "e1");
+        assert_eq!(request.config, None);
+    }
+
+    #[test]
+    fn omitted_level_and_timezone_are_not_cli_supplied() {
+        let input = parse_input(BASE);
+        assert!(input.levels.is_empty());
+        assert_eq!(input.timezone, None);
     }
 
     #[test]
@@ -315,13 +340,13 @@ mod tests {
             "/tmp/aemlog.toml",
             "--raw-sample",
         ]);
-        let request = parse(&args);
-        assert_eq!(request.ims_context.as_deref(), Some("ctx"));
+        let input = parse_input(&args);
+        assert_eq!(input.ims_context.as_deref(), Some("ctx"));
         assert_eq!(
-            request.config.as_deref(),
+            input.config.as_deref(),
             Some(std::path::Path::new("/tmp/aemlog.toml"))
         );
-        assert!(request.raw_sample);
+        assert!(input.raw_sample);
     }
 
     #[test]
