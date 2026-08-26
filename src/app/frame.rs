@@ -1,6 +1,7 @@
 use std::time::{Duration, Instant};
 
 use super::cli::Level;
+#[cfg(test)]
 use super::tuning::{DEFAULT_EVENT_BYTES, DEFAULT_EVENT_LINES, DEFAULT_SAMPLE_BYTES};
 
 /// Flush a pending event after this much byte inactivity.
