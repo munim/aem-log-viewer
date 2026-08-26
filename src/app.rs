@@ -1,5 +1,7 @@
 mod cli;
 mod error;
+mod live;
+mod source;
 
 use std::io::IsTerminal;
 
@@ -17,7 +19,11 @@ fn execute(raw: RawArgs) -> Result<(), Error> {
     if !request.json && !std::io::stdout().is_terminal() {
         return Err(Error::NonTty);
     }
-    Ok(())
+    if request.json {
+        live::run(&request)
+    } else {
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -29,7 +35,7 @@ mod tests {
     }
 
     #[test]
-    fn json_invocation_runs_without_aio_or_tty() {
+    fn json_request_is_accepted_before_source_start() {
         let raw = parse(&[
             "aemlog",
             "--program-id",
@@ -40,7 +46,8 @@ mod tests {
             "author",
             "--json",
         ]);
-        execute(raw).expect("accepted json invocation");
+        let request = cli::Request::try_from(raw).expect("accepted json invocation");
+        assert!(request.json);
     }
 
     #[test]

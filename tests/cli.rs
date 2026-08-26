@@ -53,7 +53,7 @@ fn help_documents_the_cli_contract() {
 }
 
 #[test]
-fn accepted_json_invocation_exits_0_without_aio() {
+fn accepted_json_invocation_without_aio_exits_1() {
     let output = run(&[
         "--program-id",
         "p1",
@@ -74,7 +74,8 @@ fn accepted_json_invocation_exits_0_without_aio() {
         "--json",
         "--raw-sample",
     ]);
-    assert_eq!(output.status.code(), Some(0), "stderr={}", stderr(&output));
+    assert_eq!(output.status.code(), Some(1), "stderr={}", stderr(&output));
+    assert!(stderr(&output).contains("aio"), "{}", stderr(&output));
 }
 
 #[test]

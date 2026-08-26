@@ -112,7 +112,6 @@ pub(super) enum Timezone {
 }
 
 #[derive(Debug, Eq, PartialEq)]
-#[allow(dead_code)]
 pub(super) struct Request {
     pub(super) program_id: String,
     pub(super) environment_id: String,
@@ -123,6 +122,40 @@ pub(super) struct Request {
     pub(super) timezone: Timezone,
     pub(super) json: bool,
     pub(super) raw_sample: bool,
+}
+
+impl Service {
+    pub(super) fn as_str(self) -> &'static str {
+        match self {
+            Self::Author => "author",
+            Self::Publish => "publish",
+        }
+    }
+}
+
+impl Level {
+    pub(super) fn as_str(self) -> &'static str {
+        match self {
+            Self::Trace => "TRACE",
+            Self::Debug => "DEBUG",
+            Self::Info => "INFO",
+            Self::Warn => "WARN",
+            Self::Error => "ERROR",
+            Self::Fatal => "FATAL",
+        }
+    }
+
+    pub(super) fn from_aem(token: &str) -> Option<Self> {
+        Some(match token {
+            "TRACE" => Self::Trace,
+            "DEBUG" => Self::Debug,
+            "INFO" => Self::Info,
+            "WARN" => Self::Warn,
+            "ERROR" => Self::Error,
+            "FATAL" => Self::Fatal,
+            _ => return None,
+        })
+    }
 }
 
 impl TryFrom<RawArgs> for Request {
