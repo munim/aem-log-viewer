@@ -239,6 +239,7 @@ pub(super) fn from_table(table: &toml::Table) -> Result<Tuning, String> {
     Ok(tuning)
 }
 
+#[cfg(test)]
 pub(super) fn from_toml_str(text: &str) -> Result<Tuning, String> {
     let value: Value = toml::from_str(text).map_err(|err| err.to_string())?;
     match value {
