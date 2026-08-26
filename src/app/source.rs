@@ -89,9 +89,7 @@ impl Source {
 
     fn spawn_command(mut cmd: Command) -> Result<Self, Error> {
         apply_process_group(&mut cmd);
-        let child = cmd
-            .spawn()
-            .map_err(|err| Error::Spawn(err.to_string()))?;
+        let child = cmd.spawn().map_err(|err| Error::Spawn(err.to_string()))?;
         let pid = child.id() as i32;
         Ok(Self {
             child,
@@ -388,10 +386,7 @@ mod tests {
     fn signal_process_group_refuses_analyzer_group() {
         let own = self_pgid();
         let err = signal_process_group(own, libc::SIGUSR1).expect_err("own group");
-        assert!(
-            err.contains("analyzer process group"),
-            "{err}"
-        );
+        assert!(err.contains("analyzer process group"), "{err}");
         assert!(pid_alive(std::process::id() as i32));
         let err = signal_process_group(0, libc::SIGTERM).expect_err("zero");
         assert!(err.contains("invalid"), "{err}");
