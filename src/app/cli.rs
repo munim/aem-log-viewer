@@ -123,7 +123,7 @@ pub(super) struct CliInput {
     pub(super) raw_sample: bool,
 }
 
-#[derive(Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 #[allow(dead_code)]
 pub(super) struct Request {
     pub(super) program_id: String,

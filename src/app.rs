@@ -8,6 +8,7 @@ mod redact;
 mod source;
 mod template;
 mod time;
+mod tui;
 mod tuning;
 
 use std::io::IsTerminal;
@@ -32,7 +33,7 @@ fn execute(raw: RawArgs, roots: SearchRoots) -> Result<(), Error> {
     if request.json {
         live::run(&request)
     } else {
-        Ok(())
+        tui::run(&request)
     }
 }
 

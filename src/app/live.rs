@@ -36,23 +36,24 @@ struct Group {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-struct GroupAggregate {
-    id: u64,
-    count: u64,
-    first_seen: DateTime<Utc>,
-    last_seen: DateTime<Utc>,
-    template: Vec<String>,
-    nodes: Vec<String>,
-    sample: String,
-    muted: bool,
+pub(super) struct GroupAggregate {
+    pub id: u64,
+    pub count: u64,
+    pub first_seen: DateTime<Utc>,
+    pub last_seen: DateTime<Utc>,
+    pub template: Vec<String>,
+    pub nodes: Vec<String>,
+    pub sample: String,
+    pub muted: bool,
+    pub level: Level,
+    pub logger: String,
+    pub terminal_exception: Option<String>,
     #[cfg_attr(not(test), allow(dead_code))]
-    level: Level,
+    pub is_overflow: bool,
     #[cfg_attr(not(test), allow(dead_code))]
-    is_overflow: bool,
+    pub capacity_global: u64,
     #[cfg_attr(not(test), allow(dead_code))]
-    capacity_global: u64,
-    #[cfg_attr(not(test), allow(dead_code))]
-    capacity_template_bucket: u64,
+    pub capacity_template_bucket: u64,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -71,6 +72,69 @@ struct Overflow {
     nodes: BTreeSet<String>,
     global: u64,
     template_bucket: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum ProcessState {
+    Starting,
+    AioRunning,
+    Ended,
+}
+
+impl ProcessState {
+    pub(super) fn label(self) -> &'static str {
+        match self {
+            Self::Starting => "Starting",
+            Self::AioRunning => "AIO running / awaiting logs",
+            Self::Ended => "Ended",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum OverflowState {
+    None,
+    Events(u64),
+}
+
+impl OverflowState {
+    pub(super) fn label(self) -> String {
+        match self {
+            Self::None => "none".into(),
+            Self::Events(count) => format!("{count}"),
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub(super) struct Snapshot {
+    pub program_id: String,
+    pub environment_id: String,
+    pub service: String,
+    pub process: ProcessState,
+    pub started_at: Instant,
+    pub selected_events: u64,
+    pub diagnostics: u64,
+    pub overflow: OverflowState,
+    pub groups: Vec<GroupAggregate>,
+    pub generation: u64,
+}
+
+impl Snapshot {
+    pub(super) fn group_count(&self) -> usize {
+        self.groups.len()
+    }
+
+    pub(super) fn volume_rows(&self) -> Vec<&GroupAggregate> {
+        let mut rows: Vec<&GroupAggregate> = self.groups.iter().collect();
+        rows.sort_by(|left, right| {
+            right
+                .count
+                .cmp(&left.count)
+                .then_with(|| left.id.cmp(&right.id))
+        });
+        rows
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -103,6 +167,9 @@ struct Analyzer {
     raw_sample: bool,
     templates: TemplateStore,
     rate_params: RateParams,
+    selected_events: u64,
+    diagnostics: u64,
+    emit_diagnostics: bool,
 }
 
 #[derive(Serialize)]
@@ -295,26 +362,246 @@ pub(super) fn run(request: &Request) -> Result<(), Error> {
     }
 }
 
+pub(super) struct LiveSession {
+    snapshots: std::sync::Arc<std::sync::Mutex<Snapshot>>,
+    stop: std::sync::Arc<AtomicBool>,
+    worker: Option<std::thread::JoinHandle<Result<(), Error>>>,
+}
+
+impl LiveSession {
+    pub(super) fn start(request: Request) -> Result<Self, Error> {
+        let started_at = Instant::now();
+        let mut source = source::Source::spawn(&request)?;
+        let stdout = source
+            .take_stdout()
+            .ok_or_else(|| Error::Io("aio stdout was not piped".into()))?;
+        let stderr = source
+            .take_stderr()
+            .ok_or_else(|| Error::Io("aio stderr was not piped".into()))?;
+        let snapshots = std::sync::Arc::new(std::sync::Mutex::new(Snapshot {
+            program_id: request.program_id.clone(),
+            environment_id: request.environment_id.clone(),
+            service: request.service.as_str().to_owned(),
+            process: ProcessState::Starting,
+            started_at,
+            selected_events: 0,
+            diagnostics: 0,
+            overflow: OverflowState::None,
+            groups: Vec::new(),
+            generation: 0,
+        }));
+        let stop = std::sync::Arc::new(AtomicBool::new(false));
+        let published = snapshots.clone();
+        let stop_flag = stop.clone();
+        let worker = std::thread::Builder::new()
+            .name("aemlog-ingest".into())
+            .spawn(move || {
+                run_live(
+                    request, source, stdout, stderr, published, stop_flag, started_at,
+                )
+            })
+            .map_err(|err| Error::Io(err.to_string()))?;
+        Ok(Self {
+            snapshots,
+            stop,
+            worker: Some(worker),
+        })
+    }
+
+    pub(super) fn snapshot(&self) -> Snapshot {
+        self.snapshots
+            .lock()
+            .unwrap_or_else(|err| err.into_inner())
+            .clone()
+    }
+
+    pub(super) fn request_stop(&self) {
+        self.stop.store(true, Ordering::SeqCst);
+    }
+
+    pub(super) fn finished(&self) -> bool {
+        self.worker
+            .as_ref()
+            .map(std::thread::JoinHandle::is_finished)
+            .unwrap_or(true)
+    }
+
+    pub(super) fn join(mut self) -> Result<(), Error> {
+        self.request_stop();
+        match self.worker.take() {
+            Some(worker) => worker
+                .join()
+                .unwrap_or_else(|_| Err(Error::Io("ingest thread panicked".into()))),
+            None => Ok(()),
+        }
+    }
+}
+
+impl Drop for LiveSession {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::SeqCst);
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
+        }
+    }
+}
+
+fn publish_snapshot(
+    snapshots: &std::sync::Arc<std::sync::Mutex<Snapshot>>,
+    mut snapshot: Snapshot,
+) {
+    let mut guard = snapshots.lock().unwrap_or_else(|err| err.into_inner());
+    snapshot.generation = guard.generation.saturating_add(1);
+    *guard = snapshot;
+}
+
+fn run_live(
+    request: Request,
+    mut source: source::Source,
+    stdout: std::process::ChildStdout,
+    stderr: std::process::ChildStderr,
+    snapshots: std::sync::Arc<std::sync::Mutex<Snapshot>>,
+    stop: std::sync::Arc<AtomicBool>,
+    started_at: Instant,
+) -> Result<(), Error> {
+    let drain = std::thread::spawn(move || {
+        let mut stderr = stderr;
+        let _ = std::io::copy(&mut stderr, &mut std::io::sink());
+    });
+
+    let (tx, rx) = mpsc::channel::<Option<Vec<u8>>>();
+    let reader = std::thread::spawn(move || {
+        let mut stdout = stdout;
+        let mut buf = [0u8; 8192];
+        loop {
+            match stdout.read(&mut buf) {
+                Ok(0) => {
+                    let _ = tx.send(None);
+                    break;
+                }
+                Ok(n) => {
+                    if tx.send(Some(buf[..n].to_vec())).is_err() {
+                        break;
+                    }
+                }
+                Err(_) => {
+                    let _ = tx.send(None);
+                    break;
+                }
+            }
+        }
+    });
+
+    let mut analyzer = Analyzer::with_tuning(
+        request.levels.clone(),
+        TimeInterpreter::new(request.timezone),
+        Redactor::new(request.tuning.extra_patterns.clone()),
+        request.raw_sample,
+        &request.tuning,
+    )
+    .with_rate_params(RateParams::from_tuning(&request.tuning));
+    let mut framer = Framer::with_limits(
+        request.tuning.event_max_bytes,
+        request.tuning.event_max_lines,
+        request.tuning.sample_max_bytes,
+    );
+    let mut sink = std::io::sink();
+    analyzer.emit_diagnostics = false;
+    let mut process = ProcessState::AioRunning;
+    publish_snapshot(&snapshots, analyzer.snapshot(&request, process, started_at));
+
+    let mut user_stop = false;
+    loop {
+        if stop.load(Ordering::SeqCst) {
+            user_stop = true;
+            break;
+        }
+        match rx.recv_timeout(STOP_POLL) {
+            Ok(Some(chunk)) => {
+                accept_frames_with(
+                    &mut analyzer,
+                    framer.push(&chunk, Instant::now()),
+                    &mut sink,
+                    false,
+                )?;
+                publish_snapshot(&snapshots, analyzer.snapshot(&request, process, started_at));
+            }
+            Ok(None) => {
+                accept_frames_with(&mut analyzer, framer.finish(), &mut sink, false)?;
+                break;
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                let frames = framer.poll_idle(Instant::now());
+                if !frames.is_empty() {
+                    accept_frames_with(&mut analyzer, frames, &mut sink, false)?;
+                    publish_snapshot(&snapshots, analyzer.snapshot(&request, process, started_at));
+                }
+                if source.try_wait()?.is_some() {
+                    break;
+                }
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                accept_frames_with(&mut analyzer, framer.finish(), &mut sink, false)?;
+                break;
+            }
+        }
+    }
+
+    if stop.load(Ordering::SeqCst) {
+        user_stop = true;
+    }
+    let status = if user_stop {
+        source.shutdown()?
+    } else {
+        source.wait()?
+    };
+    let _ = reader.join();
+    let _ = drain.join();
+    process = ProcessState::Ended;
+    publish_snapshot(&snapshots, analyzer.snapshot(&request, process, started_at));
+    if user_stop {
+        Ok(())
+    } else {
+        Err(Error::UnexpectedEnd(
+            status
+                .map(|code| code.to_string())
+                .unwrap_or_else(|| "signal".into()),
+        ))
+    }
+}
+
 fn accept_frames(
     analyzer: &mut Analyzer,
     frames: Vec<Frame>,
     out: &mut impl Write,
 ) -> Result<(), Error> {
+    accept_frames_with(analyzer, frames, out, true)
+}
+
+fn accept_frames_with(
+    analyzer: &mut Analyzer,
+    frames: Vec<Frame>,
+    out: &mut impl Write,
+    emit_diagnostics: bool,
+) -> Result<(), Error> {
     for item in frames {
         match item {
             Frame::Event(event) => analyzer.ingest(&event, Utc::now(), out)?,
             Frame::Diagnostic(diag) => {
-                eprintln!(
-                    "parser diagnostic: {} count={} line={} offset={} sample={}",
-                    diag.reason.as_str(),
-                    diag.count,
-                    diag.line,
-                    diag.offset,
-                    analyzer
-                        .redactor
-                        .redact_sample(&diag.sample, analyzer.raw_sample)
-                        .trim_end_matches(['\r', '\n']),
-                );
+                analyzer.diagnostics = analyzer.diagnostics.saturating_add(diag.count.max(1));
+                if emit_diagnostics {
+                    eprintln!(
+                        "parser diagnostic: {} count={} line={} offset={} sample={}",
+                        diag.reason.as_str(),
+                        diag.count,
+                        diag.line,
+                        diag.offset,
+                        analyzer
+                            .redactor
+                            .redact_sample(&diag.sample, analyzer.raw_sample)
+                            .trim_end_matches(['\r', '\n']),
+                    );
+                }
             }
         }
     }
@@ -360,6 +647,9 @@ impl Analyzer {
             raw_sample,
             templates: TemplateStore::new(tuning.similarity, tuning.bucket_cap),
             rate_params: RateParams::default(),
+            selected_events: 0,
+            diagnostics: 0,
+            emit_diagnostics: true,
         }
     }
 
@@ -400,14 +690,18 @@ impl Analyzer {
         if !self.levels.contains(&metadata.level) {
             return Ok(());
         }
+        self.selected_events += 1;
         let interpreted = self.times.interpret(metadata.timestamp, arrived_at);
         if let Some(fault) = interpreted.fallback {
-            eprintln!(
-                "parser diagnostic: {} sample={}",
-                fault.as_str(),
-                self.redactor
-                    .redact_sample(metadata.timestamp, self.raw_sample)
-            );
+            self.diagnostics = self.diagnostics.saturating_add(1);
+            if self.emit_diagnostics {
+                eprintln!(
+                    "parser diagnostic: {} sample={}",
+                    fault.as_str(),
+                    self.redactor
+                        .redact_sample(metadata.timestamp, self.raw_sample)
+                );
+            }
         }
         let outcome = self.templates.learn_allowing(
             metadata.level,
@@ -610,6 +904,8 @@ impl Analyzer {
             sample: group.sample.clone(),
             muted: group.muted,
             level: group.bucket.level,
+            logger: group.bucket.logger.clone(),
+            terminal_exception: group.bucket.terminal_exception.clone(),
             is_overflow: false,
             capacity_global: 0,
             capacity_template_bucket: 0,
@@ -628,10 +924,60 @@ impl Analyzer {
             sample: String::new(),
             muted: false,
             level: overflow.level,
+            logger: String::new(),
+            terminal_exception: None,
             is_overflow: true,
             capacity_global: overflow.global,
             capacity_template_bucket: overflow.template_bucket,
         }
+    }
+
+    fn snapshot(&self, request: &Request, process: ProcessState, started_at: Instant) -> Snapshot {
+        Snapshot {
+            program_id: request.program_id.clone(),
+            environment_id: request.environment_id.clone(),
+            service: request.service.as_str().to_owned(),
+            process,
+            started_at,
+            selected_events: self.selected_events,
+            diagnostics: self.diagnostics,
+            overflow: {
+                let count: u64 = self.overflows.values().map(|overflow| overflow.count).sum();
+                if count == 0 {
+                    OverflowState::None
+                } else {
+                    OverflowState::Events(count)
+                }
+            },
+            groups: self.visible_groups(),
+            generation: 0,
+        }
+    }
+
+    fn visible_groups(&self) -> Vec<GroupAggregate> {
+        let mut groups: Vec<GroupAggregate> = self
+            .groups
+            .values()
+            .filter(|group| !self.removed.contains(&group.id))
+            .map(|group| self.aggregate(group))
+            .collect();
+        groups.sort_by_key(|group| group.id);
+        groups
+    }
+
+    #[cfg(test)]
+    fn snapshot_groups(&self) -> Vec<GroupAggregate> {
+        let mut groups: Vec<GroupAggregate> = self
+            .visible_groups()
+            .into_iter()
+            .chain(self.overflows.values().map(Self::overflow_aggregate))
+            .collect();
+        groups.sort_by(|a, b| {
+            a.is_overflow
+                .cmp(&b.is_overflow)
+                .then_with(|| a.id.cmp(&b.id))
+        });
+        groups
     }
 
     fn emit_domain_changes(
@@ -685,23 +1031,6 @@ impl Analyzer {
             }
         }
         Ok(())
-    }
-
-    #[cfg(test)]
-    fn snapshot_groups(&self) -> Vec<GroupAggregate> {
-        let mut groups: Vec<GroupAggregate> = self
-            .groups
-            .values()
-            .filter(|group| !self.removed.contains(&group.id))
-            .map(|group| self.aggregate(group))
-            .chain(self.overflows.values().map(Self::overflow_aggregate))
-            .collect();
-        groups.sort_by(|a, b| {
-            a.is_overflow
-                .cmp(&b.is_overflow)
-                .then_with(|| a.id.cmp(&b.id))
-        });
-        groups
     }
 
     #[cfg(test)]
@@ -968,6 +1297,55 @@ mod tests {
         assert_eq!(recs[1]["sample"], ERROR_A);
         assert_eq!(recs[1]["count"], 1);
         assert_eq!(analyzer.groups.len(), 1);
+        assert_eq!(analyzer.diagnostics, 48);
+        assert_eq!(analyzer.selected_events, 1);
+    }
+
+    #[test]
+    fn snapshot_sorts_volume_by_count_then_id_and_tracks_overflow() {
+        let mut analyzer = Analyzer::with_tuning(
+            vec![Level::Error],
+            TimeInterpreter::new(Timezone::Utc),
+            Redactor::default(),
+            false,
+            &Tuning {
+                sample_max_bytes: u64::MAX,
+                bucket_cap: 1,
+                ..Tuning::default()
+            },
+        );
+        let mut buf = Vec::new();
+        analyzer
+            .ingest(
+                "26.08.2026 12:00:00.000 author-0 *ERROR* [t] com.example.Foo alpha beta gamma delta epsilon",
+                arrival(),
+                &mut buf,
+            )
+            .unwrap();
+        analyzer
+            .ingest(
+                "26.08.2026 12:00:01.000 author-1 *ERROR* [t] com.example.Foo zzzzz yyyyy xxxxx wwwww vvvvv",
+                arrival(),
+                &mut buf,
+            )
+            .unwrap();
+        analyzer
+            .ingest(
+                "26.08.2026 12:00:02.000 author-0 *ERROR* [t] com.example.Foo alpha beta gamma delta epsilon",
+                arrival(),
+                &mut buf,
+            )
+            .unwrap();
+        let snap = analyzer.snapshot(&request(), ProcessState::AioRunning, Instant::now());
+        assert_eq!(snap.selected_events, 3);
+        assert_eq!(snap.overflow, OverflowState::Events(1));
+        assert_eq!(snap.group_count(), 1);
+        assert_eq!(snap.process.label(), "AIO running / awaiting logs");
+        let ids: Vec<u64> = snap.volume_rows().into_iter().map(|g| g.id).collect();
+        assert_eq!(ids, [1]);
+        assert_eq!(snap.groups[0].count, 2);
+        assert_eq!(snap.groups[0].level, Level::Error);
+        assert_eq!(snap.groups[0].logger, "com.example.Foo");
     }
 
     #[test]

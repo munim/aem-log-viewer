@@ -145,6 +145,17 @@ impl Source {
             .map_err(|err| Error::Io(err.to_string()))
     }
 
+    pub(super) fn try_wait(&mut self) -> Result<Option<Option<i32>>, Error> {
+        if self.reaped {
+            return Ok(Some(None));
+        }
+        match self.child.try_wait() {
+            Ok(Some(status)) => Ok(Some(self.take_status(status))),
+            Ok(None) => Ok(None),
+            Err(err) => Err(Error::Io(err.to_string())),
+        }
+    }
+
     /// SIGTERM the group, drain-wait up to two seconds, SIGKILL survivors, reap.
     pub(super) fn shutdown(&mut self) -> Result<Option<i32>, Error> {
         if self.reaped {
