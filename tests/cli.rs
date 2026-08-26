@@ -90,6 +90,7 @@ fn help_documents_the_cli_contract() {
         "status 1",
         "~/aemlog.toml",
         "never merged",
+        "version = 1",
     ] {
         assert!(help.contains(needle), "help missing {needle:?}\n{help}");
     }
@@ -228,7 +229,11 @@ fn raw_sample_without_json_exits_2() {
 #[test]
 fn missing_explicit_config_exits_2_without_home_fallback() {
     let isolate = Isolate::new();
-    fs::write(isolate.home.join("aemlog.toml"), "timezone = \"local\"\n").expect("home config");
+    fs::write(
+        isolate.home.join("aemlog.toml"),
+        "version = 1\ntimezone = \"local\"\n",
+    )
+    .expect("home config");
     let missing = isolate.root.join("missing.toml");
     let output = isolate.run(&[
         "--program-id",
@@ -272,7 +277,7 @@ fn invalid_explicit_config_exits_2() {
 fn valid_explicit_config_is_accepted_before_aio_start() {
     let isolate = Isolate::new();
     let config = isolate.cwd.join("ok.toml");
-    fs::write(&config, "timezone = \"utc\"\n").expect("ok config");
+    fs::write(&config, "version = 1\ntimezone = \"utc\"\n").expect("ok config");
     let output = isolate.run(&[
         "--program-id",
         "p1",
@@ -286,4 +291,66 @@ fn valid_explicit_config_is_accepted_before_aio_start() {
     ]);
     assert_eq!(output.status.code(), Some(1), "stderr={}", stderr(&output));
     assert!(stderr(&output).contains("aio"), "{}", stderr(&output));
+}
+
+fn json_with_config(isolate: &Isolate, config: &str) -> Output {
+    isolate.run(&[
+        "--program-id",
+        "p1",
+        "--environment-id",
+        "e1",
+        "--service",
+        "author",
+        "--config",
+        config,
+        "--json",
+    ])
+}
+
+#[test]
+fn example_toml_is_accepted_unchanged() {
+    let isolate = Isolate::new();
+    let example = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("aemlog.example.toml");
+    let output = json_with_config(&isolate, example.to_str().expect("utf8 path"));
+    assert_eq!(output.status.code(), Some(1), "stderr={}", stderr(&output));
+    assert!(stderr(&output).contains("aio"), "{}", stderr(&output));
+}
+
+#[test]
+fn missing_version_exits_2_with_exact_diagnostic() {
+    let isolate = Isolate::new();
+    let config = isolate.cwd.join("no-version.toml");
+    fs::write(&config, "timezone = \"utc\"\n").expect("write");
+    let output = json_with_config(&isolate, config.to_str().expect("utf8 path"));
+    assert_eq!(output.status.code(), Some(2), "stderr={}", stderr(&output));
+    let err = stderr(&output);
+    assert!(
+        err.contains("version is required; expected version = 1"),
+        "{err}"
+    );
+}
+
+#[test]
+fn unsupported_version_exits_2_with_exact_diagnostic() {
+    let isolate = Isolate::new();
+    let config = isolate.cwd.join("v2.toml");
+    fs::write(&config, "version = 2\n").expect("write");
+    let output = json_with_config(&isolate, config.to_str().expect("utf8 path"));
+    assert_eq!(output.status.code(), Some(2), "stderr={}", stderr(&output));
+    let err = stderr(&output);
+    assert!(
+        err.contains("unsupported config version 2; expected version = 1"),
+        "{err}"
+    );
+}
+
+#[test]
+fn unknown_config_key_exits_2() {
+    let isolate = Isolate::new();
+    let config = isolate.cwd.join("unknown.toml");
+    fs::write(&config, "version = 1\nprogram_id = \"p1\"\n").expect("write");
+    let output = json_with_config(&isolate, config.to_str().expect("utf8 path"));
+    assert_eq!(output.status.code(), Some(2), "stderr={}", stderr(&output));
+    let err = stderr(&output);
+    assert!(err.contains("unknown field 'program_id'"), "{err}");
 }

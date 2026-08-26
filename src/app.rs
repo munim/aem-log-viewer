@@ -3,6 +3,7 @@ mod config;
 mod error;
 mod live;
 mod source;
+mod tuning;
 
 use std::io::IsTerminal;
 

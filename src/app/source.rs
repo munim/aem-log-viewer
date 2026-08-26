@@ -38,6 +38,7 @@ mod tests {
 
     use super::*;
     use crate::app::cli::{Level, Service, Timezone};
+    use crate::app::tuning::Tuning;
 
     fn request(program: &str, environment: &str, ims: Option<&str>) -> Request {
         Request {
@@ -50,7 +51,7 @@ mod tests {
             timezone: Timezone::Utc,
             json: true,
             raw_sample: false,
-            loaded: None,
+            tuning: Tuning::default(),
         }
     }
 
