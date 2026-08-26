@@ -19,8 +19,7 @@ use super::redact::{RedactedRequestContext, Redactor};
 use super::source;
 use super::template::{BucketKey, TemplateStore};
 use super::time::{self, TimeInterpreter};
-#[cfg(test)]
-use super::tuning::{DEFAULT_BUCKET_CAP, DEFAULT_SIMILARITY};
+use super::tuning::{Tuning, MAX_GROUPS};
 use super::Error;
 
 struct Group {
@@ -46,6 +45,32 @@ struct GroupAggregate {
     nodes: Vec<String>,
     sample: String,
     muted: bool,
+    #[cfg_attr(not(test), allow(dead_code))]
+    level: Level,
+    #[cfg_attr(not(test), allow(dead_code))]
+    is_overflow: bool,
+    #[cfg_attr(not(test), allow(dead_code))]
+    capacity_global: u64,
+    #[cfg_attr(not(test), allow(dead_code))]
+    capacity_template_bucket: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CapacityReason {
+    Global,
+    TemplateBucket,
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+struct Overflow {
+    id: u64,
+    level: Level,
+    count: u64,
+    first_seen: DateTime<Utc>,
+    latest_effective: DateTime<Utc>,
+    nodes: BTreeSet<String>,
+    global: u64,
+    template_bucket: u64,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -68,8 +93,10 @@ struct Analyzer {
     session_id: String,
     levels: Vec<Level>,
     groups: HashMap<String, Group>,
+    overflows: HashMap<Level, Overflow>,
     removed: HashSet<u64>,
     next_group_id: u64,
+    max_groups: usize,
     sample_max_bytes: usize,
     times: TimeInterpreter,
     redactor: Redactor,
@@ -204,14 +231,12 @@ pub(super) fn run(request: &Request) -> Result<(), Error> {
         }
     });
 
-    let mut analyzer = Analyzer::with_sample_limit(
+    let mut analyzer = Analyzer::with_tuning(
         request.levels.clone(),
-        request.tuning.sample_max_bytes,
         TimeInterpreter::new(request.timezone),
         Redactor::new(request.tuning.extra_patterns.clone()),
         request.raw_sample,
-        request.tuning.similarity,
-        request.tuning.bucket_cap,
+        &request.tuning,
     )
     .with_rate_params(RateParams::from_tuning(&request.tuning));
     let mut framer = Framer::with_limits(
@@ -299,39 +324,41 @@ fn accept_frames(
 impl Analyzer {
     #[cfg(test)]
     fn new(levels: Vec<Level>) -> Self {
-        Self::with_sample_limit(
+        let tuning = Tuning {
+            sample_max_bytes: u64::MAX,
+            ..Tuning::default()
+        };
+        Self::with_tuning(
             levels,
-            u64::MAX,
             TimeInterpreter::new(Timezone::Utc),
             Redactor::default(),
             false,
-            DEFAULT_SIMILARITY,
-            DEFAULT_BUCKET_CAP,
+            &tuning,
         )
     }
 
-    fn with_sample_limit(
+    fn with_tuning(
         levels: Vec<Level>,
-        sample_max_bytes: u64,
         times: TimeInterpreter,
         redactor: Redactor,
         raw_sample: bool,
-        similarity: f64,
-        bucket_cap: u32,
+        tuning: &Tuning,
     ) -> Self {
         Self {
             session_id: Uuid::new_v4().to_string(),
             levels,
             groups: HashMap::new(),
+            overflows: HashMap::new(),
             removed: HashSet::new(),
             next_group_id: 1,
-            sample_max_bytes: usize::try_from(sample_max_bytes)
+            max_groups: (tuning.max_groups as usize).min(MAX_GROUPS as usize),
+            sample_max_bytes: usize::try_from(tuning.sample_max_bytes)
                 .unwrap_or(usize::MAX)
                 .max(1),
             times,
             redactor,
             raw_sample,
-            templates: TemplateStore::new(similarity, bucket_cap),
+            templates: TemplateStore::new(tuning.similarity, tuning.bucket_cap),
             rate_params: RateParams::default(),
         }
     }
@@ -382,17 +409,23 @@ impl Analyzer {
                     .redact_sample(metadata.timestamp, self.raw_sample)
             );
         }
-        let outcome = self.templates.learn(
+        let outcome = self.templates.learn_allowing(
             metadata.level,
             metadata.logger,
             metadata.terminal_exception,
             metadata.terminal_frame,
             metadata.message,
+            self.groups.len() < self.max_groups,
         );
+        let node = self.redactor.redact(metadata.node);
         let Some(key) = outcome.group_key() else {
+            let reason = match outcome {
+                super::template::LearnOutcome::Capacity { .. } => CapacityReason::TemplateBucket,
+                _ => CapacityReason::Global,
+            };
+            self.record_overflow(metadata.level, interpreted.instant, node, reason);
             return Ok(());
         };
-        let node = self.redactor.redact(metadata.node);
         let changes = if let Some(group) = self.groups.get_mut(&key) {
             group.count += 1;
             if interpreted.instant < group.first_seen {
@@ -408,6 +441,14 @@ impl Analyzer {
                 group_id: group.id,
                 count: group.count,
             }]
+        } else if self.groups.len() >= self.max_groups {
+            self.record_overflow(
+                metadata.level,
+                interpreted.instant,
+                node,
+                CapacityReason::Global,
+            );
+            Vec::new()
         } else {
             let group_id = self.next_group_id;
             self.next_group_id += 1;
@@ -469,6 +510,48 @@ impl Analyzer {
         self.emit_domain_changes(&emitted, out)
     }
 
+    fn record_overflow(
+        &mut self,
+        level: Level,
+        instant: DateTime<Utc>,
+        node: String,
+        reason: CapacityReason,
+    ) {
+        if let Some(overflow) = self.overflows.get_mut(&level) {
+            overflow.count += 1;
+            if instant < overflow.first_seen {
+                overflow.first_seen = instant;
+            }
+            overflow.latest_effective =
+                time::clamp_effective(Some(overflow.latest_effective), instant);
+            overflow.nodes.insert(node);
+            match reason {
+                CapacityReason::Global => overflow.global += 1,
+                CapacityReason::TemplateBucket => overflow.template_bucket += 1,
+            }
+            return;
+        }
+        let id = self.next_group_id;
+        self.next_group_id += 1;
+        let (global, template_bucket) = match reason {
+            CapacityReason::Global => (1, 0),
+            CapacityReason::TemplateBucket => (0, 1),
+        };
+        self.overflows.insert(
+            level,
+            Overflow {
+                id,
+                level,
+                count: 1,
+                first_seen: instant,
+                latest_effective: instant,
+                nodes: BTreeSet::from([node]),
+                global,
+                template_bucket,
+            },
+        );
+    }
+
     fn apply_merges(&mut self, outcome: &super::template::LearnOutcome) -> Vec<DomainChange> {
         let Some(bucket) = outcome.bucket() else {
             return Vec::new();
@@ -526,6 +609,28 @@ impl Analyzer {
             nodes: group.nodes.iter().cloned().collect(),
             sample: group.sample.clone(),
             muted: group.muted,
+            level: group.bucket.level,
+            is_overflow: false,
+            capacity_global: 0,
+            capacity_template_bucket: 0,
+        }
+    }
+
+    #[cfg(test)]
+    fn overflow_aggregate(overflow: &Overflow) -> GroupAggregate {
+        GroupAggregate {
+            id: overflow.id,
+            count: overflow.count,
+            first_seen: overflow.first_seen,
+            last_seen: overflow.latest_effective,
+            template: Vec::new(),
+            nodes: overflow.nodes.iter().cloned().collect(),
+            sample: String::new(),
+            muted: false,
+            level: overflow.level,
+            is_overflow: true,
+            capacity_global: overflow.global,
+            capacity_template_bucket: overflow.template_bucket,
         }
     }
 
@@ -589,8 +694,13 @@ impl Analyzer {
             .values()
             .filter(|group| !self.removed.contains(&group.id))
             .map(|group| self.aggregate(group))
+            .chain(self.overflows.values().map(Self::overflow_aggregate))
             .collect();
-        groups.sort_by_key(|group| group.id);
+        groups.sort_by(|a, b| {
+            a.is_overflow
+                .cmp(&b.is_overflow)
+                .then_with(|| a.id.cmp(&b.id))
+        });
         groups
     }
 
@@ -617,6 +727,14 @@ impl Analyzer {
     #[cfg(test)]
     fn ranked(&self, view: View, now: DateTime<Utc>) -> Vec<RateSnapshot> {
         super::rate::rank(view, &self.rate_snapshots(now), now, &self.rate_params)
+    }
+
+    #[cfg(test)]
+    fn normal_group_count(&self) -> usize {
+        self.groups
+            .values()
+            .filter(|group| !self.removed.contains(&group.id))
+            .count()
     }
 
     #[cfg(test)]
@@ -656,7 +774,6 @@ fn now_utc() -> String {
 mod tests {
     use super::*;
     use crate::app::cli::Service;
-    use crate::app::tuning::Tuning;
     use chrono::TimeZone;
 
     fn arrival() -> DateTime<Utc> {
@@ -697,14 +814,16 @@ mod tests {
         redactor: Redactor,
         raw_sample: bool,
     ) -> Vec<serde_json::Value> {
-        let mut analyzer = Analyzer::with_sample_limit(
+        let tuning = Tuning {
+            sample_max_bytes: u64::MAX,
+            ..Tuning::default()
+        };
+        let mut analyzer = Analyzer::with_tuning(
             levels,
-            u64::MAX,
             TimeInterpreter::new(Timezone::Utc),
             redactor,
             raw_sample,
-            DEFAULT_SIMILARITY,
-            DEFAULT_BUCKET_CAP,
+            &tuning,
         );
         let mut buf = Vec::new();
         analyzer.emit_session_started(&request(), &mut buf).unwrap();
@@ -858,14 +977,16 @@ mod tests {
             "message with a deliberately long continuation\n",
             "stack continuation\n",
         );
-        let mut analyzer = Analyzer::with_sample_limit(
+        let tuning = Tuning {
+            sample_max_bytes: 24,
+            ..Tuning::default()
+        };
+        let mut analyzer = Analyzer::with_tuning(
             vec![Level::Error],
-            24,
             TimeInterpreter::new(Timezone::Utc),
             Redactor::default(),
             false,
-            DEFAULT_SIMILARITY,
-            DEFAULT_BUCKET_CAP,
+            &tuning,
         );
         let mut buf = Vec::new();
         analyzer.ingest(event, arrival(), &mut buf).unwrap();
@@ -995,14 +1116,16 @@ mod tests {
         let secret = "ops@example.com";
         let event = format!("{prefix}{secret} trailing");
         let max = prefix.len() + 5;
-        let mut analyzer = Analyzer::with_sample_limit(
+        let tuning = Tuning {
+            sample_max_bytes: max as u64,
+            ..Tuning::default()
+        };
+        let mut analyzer = Analyzer::with_tuning(
             vec![Level::Error],
-            max as u64,
             TimeInterpreter::new(Timezone::Utc),
             Redactor::default(),
             false,
-            DEFAULT_SIMILARITY,
-            DEFAULT_BUCKET_CAP,
+            &tuning,
         );
         let mut buf = Vec::new();
         analyzer.ingest(&event, arrival(), &mut buf).unwrap();
@@ -1030,14 +1153,16 @@ mod tests {
 
     #[test]
     fn iana_zone_emits_utc_rfc3339_timestamp() {
-        let mut analyzer = Analyzer::with_sample_limit(
+        let tuning = Tuning {
+            sample_max_bytes: u64::MAX,
+            ..Tuning::default()
+        };
+        let mut analyzer = Analyzer::with_tuning(
             vec![Level::Error],
-            u64::MAX,
             TimeInterpreter::new(Timezone::Iana("America/New_York".parse().expect("zone"))),
             Redactor::default(),
             false,
-            DEFAULT_SIMILARITY,
-            DEFAULT_BUCKET_CAP,
+            &tuning,
         );
         let mut buf = Vec::new();
         analyzer.ingest(ERROR_A, arrival(), &mut buf).unwrap();
@@ -1048,14 +1173,16 @@ mod tests {
 
     #[test]
     fn dst_faults_mark_arrival_fallback() {
-        let mut analyzer = Analyzer::with_sample_limit(
+        let tuning = Tuning {
+            sample_max_bytes: u64::MAX,
+            ..Tuning::default()
+        };
+        let mut analyzer = Analyzer::with_tuning(
             vec![Level::Error],
-            u64::MAX,
             TimeInterpreter::new(Timezone::Iana("America/New_York".parse().expect("zone"))),
             Redactor::default(),
             false,
-            DEFAULT_SIMILARITY,
-            DEFAULT_BUCKET_CAP,
+            &tuning,
         );
         let gap =
             "08.03.2026 02:30:00.000 author-0 *ERROR* [FelixDispatchQueue] com.example.Foo spring";
@@ -1382,14 +1509,16 @@ mod tests {
 
     #[test]
     fn fallback_arrival_time_feeds_rate_clock() {
-        let mut analyzer = Analyzer::with_sample_limit(
+        let tuning = Tuning {
+            sample_max_bytes: u64::MAX,
+            ..Tuning::default()
+        };
+        let mut analyzer = Analyzer::with_tuning(
             vec![Level::Error],
-            u64::MAX,
             TimeInterpreter::new(Timezone::Iana("America/New_York".parse().expect("zone"))),
             Redactor::default(),
             false,
-            DEFAULT_SIMILARITY,
-            DEFAULT_BUCKET_CAP,
+            &tuning,
         );
         let gap =
             "08.03.2026 02:30:00.000 author-0 *ERROR* [FelixDispatchQueue] com.example.Foo spring";
@@ -1499,6 +1628,212 @@ mod tests {
                 .collect::<Vec<_>>(),
             [1, 2]
         );
+    }
+
+    fn analyzer_with(
+        levels: Vec<Level>,
+        similarity: f64,
+        bucket_cap: u32,
+        max_groups: u32,
+    ) -> Analyzer {
+        let tuning = Tuning {
+            sample_max_bytes: u64::MAX,
+            similarity,
+            bucket_cap,
+            max_groups,
+            ..Tuning::default()
+        };
+        Analyzer::with_tuning(
+            levels,
+            TimeInterpreter::new(Timezone::Utc),
+            Redactor::default(),
+            false,
+            &tuning,
+        )
+    }
+
+    fn ingest_lines(analyzer: &mut Analyzer, lines: &[String]) {
+        let mut buf = Vec::new();
+        for line in lines {
+            analyzer.ingest(line, arrival(), &mut buf).unwrap();
+        }
+    }
+
+    fn unique_line(level: &str, i: usize) -> String {
+        format!(
+            "26.08.2026 12:{min:02}:{sec:02}.{ms:03} author-{node} *{level}* [FelixDispatchQueue] com.example.Logger{i} unique-token-{i}",
+            min = (i / 60) % 60,
+            sec = i % 60,
+            ms = i % 1000,
+            node = i % 3,
+        )
+    }
+
+    fn same_bucket_line(i: usize) -> String {
+        format!(
+            "26.08.2026 12:00:00.{i:03} author-0 *ERROR* [FelixDispatchQueue] com.example.Foo unique-token-{i}"
+        )
+    }
+
+    fn overflows(groups: &[GroupAggregate]) -> Vec<&GroupAggregate> {
+        groups.iter().filter(|group| group.is_overflow).collect()
+    }
+
+    fn normals(groups: &[GroupAggregate]) -> Vec<&GroupAggregate> {
+        groups.iter().filter(|group| !group.is_overflow).collect()
+    }
+
+    #[test]
+    fn group_capacity_clamps_to_hard_ceiling() {
+        let analyzer = analyzer_with(vec![Level::Error], 1.0, 1, MAX_GROUPS.saturating_add(1));
+        assert_eq!(analyzer.max_groups, MAX_GROUPS as usize);
+    }
+
+    #[test]
+    fn capacity_zero_rejects_all_new_groups() {
+        let mut analyzer = analyzer_with(vec![Level::Error], 1.0, 8, 0);
+        ingest_lines(
+            &mut analyzer,
+            &[unique_line("ERROR", 0), unique_line("ERROR", 1)],
+        );
+        assert_eq!(analyzer.normal_group_count(), 0);
+        let snap = analyzer.snapshot_groups();
+        let overflow = overflows(&snap);
+        assert_eq!(overflow.len(), 1);
+        assert_eq!(overflow[0].level, Level::Error);
+        assert_eq!(overflow[0].count, 2);
+        assert_eq!(overflow[0].capacity_global, 2);
+        assert_eq!(overflow[0].capacity_template_bucket, 0);
+        assert_eq!(overflow[0].id, 1);
+    }
+
+    #[test]
+    fn exact_capacity_boundary_creates_no_overflow() {
+        let mut analyzer = analyzer_with(vec![Level::Error], 1.0, 8, 2);
+        ingest_lines(
+            &mut analyzer,
+            &[unique_line("ERROR", 0), unique_line("ERROR", 1)],
+        );
+        let snap = analyzer.snapshot_groups();
+        assert_eq!(analyzer.normal_group_count(), 2);
+        assert!(overflows(&snap).is_empty());
+        assert_eq!(
+            normals(&snap).iter().map(|g| g.id).collect::<Vec<_>>(),
+            [1, 2]
+        );
+    }
+
+    #[test]
+    fn first_overflow_uses_one_visible_level_group() {
+        let mut analyzer = analyzer_with(vec![Level::Error], 1.0, 8, 2);
+        ingest_lines(
+            &mut analyzer,
+            &[
+                unique_line("ERROR", 0),
+                unique_line("ERROR", 1),
+                unique_line("ERROR", 2),
+            ],
+        );
+        let snap = analyzer.snapshot_groups();
+        assert_eq!(analyzer.normal_group_count(), 2);
+        let overflow = overflows(&snap);
+        assert_eq!(overflow.len(), 1);
+        assert_eq!(overflow[0].id, 3);
+        assert_eq!(overflow[0].count, 1);
+        assert_eq!(overflow[0].capacity_global, 1);
+        assert_eq!(overflow[0].capacity_template_bucket, 0);
+        assert_eq!(
+            snap.iter()
+                .map(|g| (g.id, g.is_overflow))
+                .collect::<Vec<_>>(),
+            [(1, false), (2, false), (3, true)]
+        );
+    }
+
+    #[test]
+    fn sustained_unique_attack_stays_in_one_overflow() {
+        let mut analyzer = analyzer_with(vec![Level::Error], 1.0, 8, 3);
+        let lines: Vec<String> = (0..20).map(|i| unique_line("ERROR", i)).collect();
+        ingest_lines(&mut analyzer, &lines);
+        let snap = analyzer.snapshot_groups();
+        assert_eq!(analyzer.normal_group_count(), 3);
+        let overflow = overflows(&snap);
+        assert_eq!(overflow.len(), 1);
+        assert_eq!(overflow[0].count, 17);
+        assert_eq!(overflow[0].capacity_global, 17);
+        assert_eq!(overflow[0].capacity_template_bucket, 0);
+        assert_eq!(overflow[0].nodes.len(), 3);
+        assert_eq!(
+            time::rfc3339_millis(overflow[0].first_seen),
+            "2026-08-26T12:00:03.003Z"
+        );
+        assert_eq!(
+            time::rfc3339_millis(overflow[0].last_seen),
+            "2026-08-26T12:00:19.019Z"
+        );
+    }
+
+    #[test]
+    fn known_groups_keep_counting_after_saturation() {
+        let mut analyzer = analyzer_with(vec![Level::Error], 1.0, 8, 2);
+        ingest_lines(
+            &mut analyzer,
+            &[
+                unique_line("ERROR", 0),
+                unique_line("ERROR", 1),
+                unique_line("ERROR", 2),
+                unique_line("ERROR", 0),
+            ],
+        );
+        let snap = analyzer.snapshot_groups();
+        let normal = normals(&snap);
+        assert_eq!(normal[0].id, 1);
+        assert_eq!(normal[0].count, 2);
+        assert_eq!(normal[1].count, 1);
+        let overflow = overflows(&snap);
+        assert_eq!(overflow.len(), 1);
+        assert_eq!(overflow[0].count, 1);
+        assert_eq!(overflow[0].capacity_global, 1);
+    }
+
+    #[test]
+    fn error_and_warn_overflows_stay_distinct() {
+        let mut analyzer = analyzer_with(vec![Level::Error, Level::Warn], 1.0, 8, 2);
+        ingest_lines(
+            &mut analyzer,
+            &[
+                unique_line("ERROR", 0),
+                unique_line("WARN", 1),
+                unique_line("ERROR", 2),
+                unique_line("WARN", 3),
+                unique_line("ERROR", 4),
+            ],
+        );
+        let snap = analyzer.snapshot_groups();
+        assert_eq!(analyzer.normal_group_count(), 2);
+        let overflow = overflows(&snap);
+        assert_eq!(overflow.len(), 2);
+        assert_eq!(overflow[0].level, Level::Error);
+        assert_eq!(overflow[0].count, 2);
+        assert_eq!(overflow[0].capacity_global, 2);
+        assert_eq!(overflow[1].level, Level::Warn);
+        assert_eq!(overflow[1].count, 1);
+        assert_eq!(overflow[1].capacity_global, 1);
+        assert!(snap.iter().all(|group| group.level != Level::Fatal));
+    }
+
+    #[test]
+    fn template_bucket_exhaustion_uses_template_reason() {
+        let mut analyzer = analyzer_with(vec![Level::Error], 1.0, 2, 100);
+        let lines: Vec<String> = (0..5).map(same_bucket_line).collect();
+        ingest_lines(&mut analyzer, &lines);
+        let snap = analyzer.snapshot_groups();
+        assert_eq!(analyzer.normal_group_count(), 2);
+        let overflow = overflows(&snap);
+        assert_eq!(overflow.len(), 1);
+        assert_eq!(overflow[0].count, 3);
+        assert_eq!(overflow[0].capacity_template_bucket, 3);
+        assert_eq!(overflow[0].capacity_global, 0);
     }
 
     fn is_uuid_v4(id: &str) -> bool {
