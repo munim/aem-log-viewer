@@ -1,0 +1,4 @@
+26.08.2026 12:00:01.456 author-0 *ERROR* [192.0.2.10 [1724666401456] GET /content/site/us/en.html HTTP/1.1] com.example.core.filters.ErrorFilter Uncaught request exception
+java.lang.IllegalStateException: resource resolver closed
+	at com.example.core.filters.ErrorFilter.doFilter(ErrorFilter.java:64)
+	at org.apache.sling.engine.impl.filter.AbstractSlingFilterChain.doFilter(AbstractSlingFilterChain.java:82)

@@ -357,3 +357,50 @@ fn custom_logs_skip_unselected_levels() {
     assert_eq!(types, ["session_started", "group_created", "source_ended"]);
     assert!(recs[1]["sample"].as_str().unwrap().contains("keep me"));
 }
+
+#[test]
+fn multiline_stack_stays_in_one_group_sample() {
+    let fake = FakeAio::install();
+    fs::write(
+        &fake.logs,
+        "\
+26.08.2026 12:00:00.123 n *ERROR* [t] com.example.Foo boom\n\
+java.lang.RuntimeException: boom\n\
+\tat com.example.Foo.bar(Foo.java:42)\n\
+26.08.2026 12:00:00.124 n *ERROR* [t] com.example.Foo boom\n\
+java.lang.RuntimeException: boom\n\
+\tat com.example.Foo.bar(Foo.java:42)\n\
+26.08.2026 12:00:00.125 n *WARN* [t] ignored\n\
+\tat com.example.Bar.skip(Bar.java:1)\n",
+    )
+    .unwrap();
+    let output = run_with_fake(
+        &fake,
+        &[
+            "--program-id",
+            "p1",
+            "--environment-id",
+            "e1",
+            "--service",
+            "author",
+            "--json",
+        ],
+        None,
+    );
+    let recs = json_lines(&output);
+    let types: Vec<&str> = recs.iter().map(|r| r["type"].as_str().unwrap()).collect();
+    assert_eq!(
+        types,
+        [
+            "session_started",
+            "group_created",
+            "group_updated",
+            "source_ended"
+        ]
+    );
+    let sample = recs[1]["sample"].as_str().unwrap();
+    assert!(sample.contains("RuntimeException"), "{sample}");
+    assert!(sample.contains("com.example.Foo.bar"), "{sample}");
+    assert!(!sample.contains("ignored"), "{sample}");
+    assert_eq!(recs[2]["count"], 2);
+}
