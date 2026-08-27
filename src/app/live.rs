@@ -129,6 +129,13 @@ impl OverflowState {
     }
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) struct SourceFailure {
+    pub status: String,
+    pub stderr: String,
+    pub stderr_truncated: bool,
+}
+
 #[derive(Clone, Debug)]
 pub(super) struct Snapshot {
     pub program_id: String,
@@ -143,6 +150,7 @@ pub(super) struct Snapshot {
     pub now: DateTime<Utc>,
     pub rate_params: RateParams,
     pub generation: u64,
+    pub failure: Option<SourceFailure>,
 }
 
 impl Snapshot {
@@ -371,6 +379,30 @@ impl StderrTail {
     }
 }
 
+fn drain_stderr(
+    stderr: std::process::ChildStderr,
+) -> (Arc<Mutex<StderrTail>>, std::thread::JoinHandle<()>) {
+    let tail = Arc::new(Mutex::new(StderrTail::new()));
+    let drain_tail = Arc::clone(&tail);
+    let handle = std::thread::spawn(move || {
+        let mut stderr = stderr;
+        let mut buf = [0u8; 8192];
+        loop {
+            match stderr.read(&mut buf) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => drain_tail.lock().expect("stderr tail").push(&buf[..n]),
+            }
+        }
+    });
+    (tail, handle)
+}
+
+pub(super) fn status_label(status: Option<i32>) -> String {
+    status
+        .map(|code| code.to_string())
+        .unwrap_or_else(|| "signal".into())
+}
+
 static USER_STOP: AtomicBool = AtomicBool::new(false);
 
 const STOP_POLL: Duration = Duration::from_millis(50);
@@ -395,18 +427,7 @@ pub(super) fn run(request: &Request) -> Result<(), Error> {
     let stderr = source
         .take_stderr()
         .ok_or_else(|| Error::Io("aio stderr was not piped".into()))?;
-    let tail = Arc::new(Mutex::new(StderrTail::new()));
-    let drain_tail = Arc::clone(&tail);
-    let drain = std::thread::spawn(move || {
-        let mut stderr = stderr;
-        let mut buf = [0u8; 8192];
-        loop {
-            match stderr.read(&mut buf) {
-                Ok(0) | Err(_) => break,
-                Ok(n) => drain_tail.lock().expect("stderr tail").push(&buf[..n]),
-            }
-        }
-    });
+    let (tail, drain) = drain_stderr(stderr);
 
     let (tx, rx) = mpsc::sync_channel::<Option<Vec<u8>>>(PIPE_QUEUE);
     let reader = std::thread::spawn(move || {
@@ -529,11 +550,7 @@ pub(super) fn run(request: &Request) -> Result<(), Error> {
     } else if user_stop {
         Ok(())
     } else {
-        Err(Error::UnexpectedEnd(
-            status
-                .map(|code| code.to_string())
-                .unwrap_or_else(|| "signal".into()),
-        ))
+        Err(Error::UnexpectedEnd(status_label(status)))
     }
 }
 
@@ -542,6 +559,7 @@ pub(super) struct LiveSession {
     commands: mpsc::Sender<SessionCommand>,
     stop: std::sync::Arc<AtomicBool>,
     worker: Option<std::thread::JoinHandle<Result<(), Error>>>,
+    pgid: i32,
 }
 
 impl LiveSession {
@@ -567,11 +585,13 @@ impl LiveSession {
             now: Utc::now(),
             rate_params: RateParams::from_tuning(&request.tuning),
             generation: 0,
+            failure: None,
         }));
         let (commands, command_rx) = mpsc::channel();
         let stop = std::sync::Arc::new(AtomicBool::new(false));
         let published = snapshots.clone();
         let stop_flag = stop.clone();
+        let pgid = source.pgid();
         let worker = std::thread::Builder::new()
             .name("aemlog-ingest".into())
             .spawn(move || {
@@ -585,6 +605,7 @@ impl LiveSession {
             commands,
             stop,
             worker: Some(worker),
+            pgid,
         })
     }
 
@@ -603,11 +624,33 @@ impl LiveSession {
         self.stop.store(true, Ordering::SeqCst);
     }
 
+    pub(super) fn kill_orphans(&self) {
+        let _ = source::signal_process_group(self.pgid, libc::SIGKILL);
+    }
+
+    pub(super) fn pgid(&self) -> i32 {
+        self.pgid
+    }
+
     pub(super) fn finished(&self) -> bool {
         self.worker
             .as_ref()
             .map(std::thread::JoinHandle::is_finished)
             .unwrap_or(true)
+    }
+
+    pub(super) fn take_if_finished(&mut self) -> Option<Result<(), Error>> {
+        let worker = self.worker.as_ref()?;
+        if !worker.is_finished() {
+            return None;
+        }
+        Some(
+            self.worker
+                .take()
+                .expect("finished worker")
+                .join()
+                .unwrap_or_else(|_| Err(Error::Io("ingest thread panicked".into()))),
+        )
     }
 
     pub(super) fn join(mut self) -> Result<(), Error> {
@@ -650,10 +693,7 @@ fn run_live(
     stop: std::sync::Arc<AtomicBool>,
     started_at: Instant,
 ) -> Result<(), Error> {
-    let drain = std::thread::spawn(move || {
-        let mut stderr = stderr;
-        let _ = std::io::copy(&mut stderr, &mut std::io::sink());
-    });
+    let (tail, drain) = drain_stderr(stderr);
 
     let (tx, rx) = mpsc::channel::<Option<Vec<u8>>>();
     let reader = std::thread::spawn(move || {
@@ -762,15 +802,20 @@ fn run_live(
     let _ = reader.join();
     let _ = drain.join();
     process = ProcessState::Ended;
-    publish_snapshot(&snapshots, analyzer.snapshot(&request, process, started_at));
+    let (stderr_raw, stderr_truncated) = tail.lock().expect("stderr tail").snapshot();
+    let mut snapshot = analyzer.snapshot(&request, process, started_at);
+    if !user_stop {
+        snapshot.failure = Some(SourceFailure {
+            status: status_label(status),
+            stderr: analyzer.redactor.redact(&stderr_raw),
+            stderr_truncated,
+        });
+    }
+    publish_snapshot(&snapshots, snapshot);
     if user_stop {
         Ok(())
     } else {
-        Err(Error::UnexpectedEnd(
-            status
-                .map(|code| code.to_string())
-                .unwrap_or_else(|| "signal".into()),
-        ))
+        Err(Error::UnexpectedEnd(status_label(status)))
     }
 }
 
@@ -1222,6 +1267,7 @@ impl Analyzer {
             now,
             rate_params: self.rate_params,
             generation: 0,
+            failure: None,
         }
     }
 

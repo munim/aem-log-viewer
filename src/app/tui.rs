@@ -1,7 +1,11 @@
-use std::io::{stdout, Stdout};
+use std::io::{stdout, Stdout, Write};
+use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::time::{Duration, Instant};
 
-use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use crossterm::cursor::{Hide, Show};
+use crossterm::event::{
+    self, DisableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers,
+};
 use crossterm::execute;
 use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
@@ -15,8 +19,11 @@ use ratatui::Terminal;
 use regex::RegexBuilder;
 
 use super::cli::{Level, Request};
-use super::live::{GroupAggregate, LiveSession, OverflowState, ProcessState, Snapshot};
+use super::live::{
+    GroupAggregate, LiveSession, OverflowState, ProcessState, Snapshot, SourceFailure,
+};
 use super::rate::{SortColumn, View};
+use super::source;
 use super::Error;
 
 const MIN_FRAME: Duration = Duration::from_millis(80);
@@ -46,35 +53,34 @@ enum SearchMode {
     },
 }
 
+static TTY_OWNED: AtomicBool = AtomicBool::new(false);
+static TTY_RESTORED: AtomicBool = AtomicBool::new(false);
+static USER_STOP: AtomicBool = AtomicBool::new(false);
+static CHILD_PGID: AtomicI32 = AtomicI32::new(0);
+
 struct TerminalGuard {
     terminal: Terminal<CrosstermBackend<Stdout>>,
-    restored: bool,
 }
 
 impl TerminalGuard {
     fn enter() -> Result<Self, Error> {
+        TTY_RESTORED.store(false, Ordering::SeqCst);
         enable_raw_mode().map_err(io_err)?;
+        TTY_OWNED.store(true, Ordering::SeqCst);
         let mut out = stdout();
-        execute!(out, EnterAlternateScreen).map_err(|err| {
-            let _ = disable_raw_mode();
-            io_err(err)
-        })?;
+        if let Err(err) = execute!(out, EnterAlternateScreen, Hide, DisableMouseCapture) {
+            let _ = restore_terminal();
+            return Err(io_err(err));
+        }
         let backend = CrosstermBackend::new(out);
         let terminal = Terminal::new(backend).map_err(|err| {
             let _ = restore_terminal();
             io_err(err)
         })?;
-        Ok(Self {
-            terminal,
-            restored: false,
-        })
+        Ok(Self { terminal })
     }
 
     fn restore(&mut self) -> Result<(), Error> {
-        if self.restored {
-            return Ok(());
-        }
-        self.restored = true;
         restore_terminal()
     }
 }
@@ -86,9 +92,51 @@ impl Drop for TerminalGuard {
 }
 
 fn restore_terminal() -> Result<(), Error> {
+    if !TTY_OWNED.load(Ordering::SeqCst) {
+        return Ok(());
+    }
+    if TTY_RESTORED.swap(true, Ordering::SeqCst) {
+        return Ok(());
+    }
+    TTY_OWNED.store(false, Ordering::SeqCst);
     let mut out = stdout();
-    execute!(out, LeaveAlternateScreen).map_err(io_err)?;
-    disable_raw_mode().map_err(io_err)
+    let leave = execute!(out, Show, DisableMouseCapture, LeaveAlternateScreen);
+    let raw = disable_raw_mode();
+    let _ = out.flush();
+    leave.map_err(io_err)?;
+    raw.map_err(io_err)
+}
+
+fn kill_child_group() {
+    let pgid = CHILD_PGID.swap(0, Ordering::SeqCst);
+    if pgid > 0 {
+        let _ = source::signal_process_group(pgid, libc::SIGKILL);
+    }
+}
+
+extern "C" fn on_sigint(_: libc::c_int) {
+    USER_STOP.store(true, Ordering::SeqCst);
+}
+
+extern "C" fn on_sigterm(_: libc::c_int) {
+    let _ = restore_terminal();
+    kill_child_group();
+    unsafe { libc::_exit(1) };
+}
+
+fn install_tui_handlers() {
+    USER_STOP.store(false, Ordering::SeqCst);
+    unsafe {
+        libc::signal(libc::SIGINT, on_sigint as *const () as libc::sighandler_t);
+        libc::signal(libc::SIGTERM, on_sigterm as *const () as libc::sighandler_t);
+        libc::signal(libc::SIGPIPE, libc::SIG_IGN);
+    }
+    let previous = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let _ = restore_terminal();
+        kill_child_group();
+        previous(info);
+    }));
 }
 
 fn io_err(err: impl ToString) -> Error {
@@ -110,6 +158,8 @@ struct App {
     pending_mutes: Vec<u64>,
     desired_mute: Option<(u64, bool)>,
     color: bool,
+    frozen: bool,
+    failure: Option<SourceFailure>,
 }
 
 impl App {
@@ -128,12 +178,28 @@ impl App {
             pending_mutes: Vec::new(),
             desired_mute: None,
             color: colors_enabled(),
+            frozen: false,
+            failure: None,
         };
         app.sync_selection();
+        if app.snapshot.failure.is_some() {
+            app.failure = app.snapshot.failure.clone();
+            app.frozen = true;
+        }
         app
     }
 
     fn apply_snapshot(&mut self, snapshot: Snapshot) {
+        if self.frozen {
+            if self.failure.is_none() {
+                self.failure = snapshot.failure.clone();
+            }
+            return;
+        }
+        if snapshot.failure.is_some() {
+            self.failure = snapshot.failure.clone();
+            self.frozen = true;
+        }
         self.snapshot = snapshot;
         if let Some((id, muted)) = self.desired_mute {
             if let Some(group) = self.snapshot.groups.iter_mut().find(|group| group.id == id) {
@@ -364,6 +430,11 @@ impl App {
         if key.kind != KeyEventKind::Press && key.kind != KeyEventKind::Repeat {
             return false;
         }
+        if self.failure.is_some() {
+            return matches!(key.code, KeyCode::Enter | KeyCode::Char('q'))
+                || (key.modifiers.contains(KeyModifiers::CONTROL)
+                    && key.code == KeyCode::Char('c'));
+        }
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
             return true;
         }
@@ -470,6 +541,9 @@ impl App {
     }
 
     fn footer(&self) -> String {
+        if self.failure.is_some() {
+            return "[Enter]acknowledge  [q]acknowledge".into();
+        }
         if self.help {
             return "[q]uit  [?]close  [Esc]close".into();
         }
@@ -607,21 +681,33 @@ fn level_cue(level: Level) -> &'static str {
 }
 
 pub(super) fn run(request: &Request) -> Result<(), Error> {
-    let session = LiveSession::start(request.clone())?;
-    let result = run_ui(&session);
-    session.request_stop();
-    match session.join() {
-        Ok(()) => result,
-        Err(Error::UnexpectedEnd(_)) if result.is_ok() => result,
+    install_tui_handlers();
+    let mut guard = TerminalGuard::enter()?;
+    let mut session = match LiveSession::start(request.clone()) {
+        Ok(session) => session,
         Err(err) => {
-            let _ = result;
-            Err(err)
+            let _ = guard.restore();
+            return Err(err);
         }
+    };
+    CHILD_PGID.store(session.pgid(), Ordering::SeqCst);
+    let outcome = run_ui(&mut session, &mut guard);
+    session.request_stop();
+    let _join = session.join();
+    CHILD_PGID.store(0, Ordering::SeqCst);
+    match outcome {
+        UiOutcome::Quit => Ok(()),
+        UiOutcome::AcknowledgedFailure(err) | UiOutcome::Failed(err) => Err(err),
     }
 }
 
-fn run_ui(session: &LiveSession) -> Result<(), Error> {
-    let mut guard = TerminalGuard::enter()?;
+enum UiOutcome {
+    Quit,
+    AcknowledgedFailure(Error),
+    Failed(Error),
+}
+
+fn run_ui(session: &mut LiveSession, guard: &mut TerminalGuard) -> UiOutcome {
     let mut app = App::new(session.snapshot());
     let mut last_gen = app.snapshot.generation;
     let mut last_draw = Instant::now()
@@ -629,22 +715,56 @@ fn run_ui(session: &LiveSession) -> Result<(), Error> {
         .unwrap_or_else(Instant::now);
     let mut dirty = true;
     loop {
+        if USER_STOP.load(Ordering::SeqCst) {
+            if app.failure.is_some() {
+                break;
+            }
+            session.request_stop();
+            return restore_and_quit(guard);
+        }
         let snap = session.snapshot();
         if snap.generation != last_gen {
             last_gen = snap.generation;
             app.apply_snapshot(snap);
             dirty = true;
         }
-        if !app.pending_mutes.is_empty() {
+        if app.failure.is_none() {
+            if let Some(result) = session.take_if_finished() {
+                match result {
+                    Ok(()) => {}
+                    Err(Error::UnexpectedEnd(status)) => {
+                        app.failure = Some(session.snapshot().failure.unwrap_or(SourceFailure {
+                            status,
+                            stderr: String::new(),
+                            stderr_truncated: false,
+                        }));
+                        app.frozen = true;
+                        dirty = true;
+                    }
+                    Err(err) => {
+                        session.kill_orphans();
+                        let _ = guard.restore();
+                        return UiOutcome::Failed(err);
+                    }
+                }
+            }
+        }
+        if !app.pending_mutes.is_empty() && !app.frozen {
             for id in app.pending_mutes.drain(..) {
                 session.toggle_mute(id);
             }
         }
         if dirty && last_draw.elapsed() >= MIN_FRAME {
-            guard
+            if let Err(err) = guard
                 .terminal
                 .draw(|frame| render(frame, &app))
-                .map_err(io_err)?;
+                .map_err(io_err)
+            {
+                session.request_stop();
+                session.kill_orphans();
+                let _ = guard.restore();
+                return UiOutcome::Failed(err);
+            }
             last_draw = Instant::now();
             dirty = false;
         }
@@ -656,26 +776,89 @@ fn run_ui(session: &LiveSession) -> Result<(), Error> {
         } else {
             POLL
         };
-        if event::poll(wait).map_err(io_err)? {
-            match event::read().map_err(io_err)? {
-                Event::Key(key) => {
+        match event::poll(wait) {
+            Ok(true) => match event::read() {
+                Ok(Event::Key(key)) => {
                     if app.handle(key) {
-                        break;
+                        if app.failure.is_some() {
+                            break;
+                        }
+                        if session.finished() {
+                            if let Some(result) = session.take_if_finished() {
+                                match result {
+                                    Ok(()) => {
+                                        session.request_stop();
+                                        return restore_and_quit(guard);
+                                    }
+                                    Err(Error::UnexpectedEnd(status)) => {
+                                        app.failure = Some(session.snapshot().failure.unwrap_or(
+                                            SourceFailure {
+                                                status,
+                                                stderr: String::new(),
+                                                stderr_truncated: false,
+                                            },
+                                        ));
+                                        app.frozen = true;
+                                        dirty = true;
+                                        continue;
+                                    }
+                                    Err(err) => {
+                                        session.kill_orphans();
+                                        let _ = guard.restore();
+                                        return UiOutcome::Failed(err);
+                                    }
+                                }
+                            }
+                            dirty = true;
+                            continue;
+                        }
+                        session.request_stop();
+                        return restore_and_quit(guard);
                     }
                     dirty = true;
                 }
-                Event::Resize(_, _) => dirty = true,
-                _ => {}
+                Ok(Event::Resize(_, _)) => dirty = true,
+                Ok(_) => {}
+                Err(err) => {
+                    session.request_stop();
+                    session.kill_orphans();
+                    let _ = guard.restore();
+                    return UiOutcome::Failed(io_err(err));
+                }
+            },
+            Ok(false) => {}
+            Err(err) => {
+                session.request_stop();
+                session.kill_orphans();
+                let _ = guard.restore();
+                return UiOutcome::Failed(io_err(err));
             }
         }
     }
-    guard.restore()
+    let restore_err = guard.restore().err();
+    if let Some(failure) = app.failure {
+        return UiOutcome::AcknowledgedFailure(Error::UnexpectedEnd(failure.status));
+    }
+    if let Some(err) = restore_err {
+        return UiOutcome::Failed(err);
+    }
+    UiOutcome::Quit
+}
+
+fn restore_and_quit(guard: &mut TerminalGuard) -> UiOutcome {
+    match guard.restore() {
+        Ok(()) => UiOutcome::Quit,
+        Err(err) => UiOutcome::Failed(err),
+    }
 }
 
 fn render(frame: &mut ratatui::Frame<'_>, app: &App) {
     let area = frame.area();
     if app.too_small(area) {
         render_resize_gate(frame, area, app.color);
+        if app.failure.is_some() {
+            render_failure(frame, area, app);
+        }
         return;
     }
     let [header, body, footer] = Layout::vertical([
@@ -690,8 +873,11 @@ fn render(frame: &mut ratatui::Frame<'_>, app: &App) {
         Screen::Detail => render_detail(frame, body, app),
     }
     frame.render_widget(Paragraph::new(app.footer()), footer);
-    if app.help {
+    if app.help && app.failure.is_none() {
         render_help(frame, area, app);
+    }
+    if app.failure.is_some() {
+        render_failure(frame, area, app);
     }
 }
 
@@ -1028,6 +1214,51 @@ fn search_status_line(app: &App) -> String {
     }
 }
 
+fn render_failure(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
+    let Some(failure) = &app.failure else {
+        return;
+    };
+    let width = area.width.clamp(48, 84);
+    let height = area.height.saturating_sub(2).clamp(10, 22);
+    let x = area.x + (area.width.saturating_sub(width)) / 2;
+    let y = area.y + (area.height.saturating_sub(height)) / 2;
+    let rect = Rect::new(x, y, width, height);
+    let truncated = if failure.stderr_truncated {
+        "truncated"
+    } else {
+        "complete"
+    };
+    let mut lines = vec![
+        Line::from(Span::styled("source failed", role_emphasis())),
+        Line::from(format!("aio status {}", failure.status)),
+        Line::from(format!("stderr {truncated}")),
+        Line::from("ingestion stopped; last counts frozen"),
+        Line::from("Enter or q acknowledge, then restore and exit 1"),
+        Line::from(""),
+        Line::from(Span::styled("stderr", role_emphasis())),
+    ];
+    if failure.stderr.is_empty() {
+        lines.push(Line::from("(empty)"));
+    } else {
+        for line in escape_visible(&failure.stderr).lines() {
+            lines.push(Line::from(line.to_owned()));
+        }
+    }
+    frame.render_widget(Clear, rect);
+    frame.render_widget(
+        Paragraph::new(lines)
+            .wrap(Wrap { trim: false })
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title("failure")
+                    .style(role_error(app.color)),
+            )
+            .style(role_error(app.color)),
+        rect,
+    );
+}
+
 fn escape_visible(input: &str) -> String {
     let mut out = String::with_capacity(input.len());
     for ch in input.chars() {
@@ -1100,7 +1331,7 @@ fn render_help(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
 mod tests {
     use super::*;
     use crate::app::cli::Level;
-    use crate::app::live::{GroupAggregate, OverflowState, ProcessState};
+    use crate::app::live::{GroupAggregate, OverflowState, ProcessState, SourceFailure};
     use crate::app::rate::RateParams;
     use chrono::{TimeZone, Utc};
     use ratatui::backend::TestBackend;
@@ -1150,6 +1381,7 @@ mod tests {
             now,
             rate_params: RateParams::default(),
             generation: 1,
+            failure: None,
         }
     }
 
@@ -1803,7 +2035,64 @@ mod tests {
         let src = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/app/tui.rs"));
         let live = src.split("mod tests").next().expect("source");
         assert!(!live.contains("EnableMouseCapture"));
-        assert!(!live.contains("DisableMouseCapture"));
         assert!(!live.contains("MouseEvent"));
+        assert!(live.contains("DisableMouseCapture"));
+        assert!(live.contains("LeaveAlternateScreen"));
+        assert!(live.contains("Show"));
+        assert!(live.contains("Hide"));
+    }
+
+    #[test]
+    fn unexpected_end_freezes_counts_and_traps_overlay() {
+        let mut app = App::new(snapshot(vec![group(1, 4, "frozen row")]));
+        app.handle(press(KeyCode::Char('j')));
+        let selected = app.selected;
+        let mut ended = snapshot(vec![group(1, 4, "frozen row"), group(2, 9, "late")]);
+        ended.process = ProcessState::Ended;
+        ended.selected_events = 13;
+        ended.generation = 9;
+        ended.failure = Some(SourceFailure {
+            status: "0".into(),
+            stderr: "token=supersecret\x1b[31mred\x1b[0m".into(),
+            stderr_truncated: true,
+        });
+        app.apply_snapshot(ended);
+        assert!(app.frozen);
+        assert_eq!(app.snapshot.selected_events, 13);
+        let mut later = snapshot(vec![group(1, 99, "should not appear")]);
+        later.generation = 10;
+        later.selected_events = 99;
+        app.apply_snapshot(later);
+        assert_eq!(app.snapshot.selected_events, 13);
+        assert_eq!(app.selected, selected);
+        assert!(!app.handle(press(KeyCode::Char('j'))));
+        assert_eq!(app.selected, selected);
+        assert!(app.handle(press(KeyCode::Enter)));
+        let mut app = App::new(snapshot(vec![group(1, 4, "frozen row")]));
+        let mut ended = snapshot(vec![group(1, 4, "frozen row")]);
+        ended.failure = Some(SourceFailure {
+            status: "signal".into(),
+            stderr: "oops\x1b[2J".into(),
+            stderr_truncated: false,
+        });
+        app.apply_snapshot(ended);
+        assert!(app.handle(press(KeyCode::Enter)));
+        let text = buffer_text(&draw_at(&app, 120, 24));
+        assert!(text.contains("source failed"), "{text}");
+        assert!(text.contains("aio status signal"), "{text}");
+        assert!(text.contains("complete"), "{text}");
+        assert!(text.contains("\\x1b[2J"), "{text}");
+        assert!(!text.contains("\u{1b}[2J"), "{text}");
+        assert!(text.contains("[Enter]acknowledge"), "{text}");
+        assert!(
+            text.contains("truncated") || text.contains("complete"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn escape_visible_keeps_control_sequences_readable() {
+        assert_eq!(escape_visible("\x1b[31mred\x07"), "\\x1b[31mred\\x07");
+        assert_eq!(escape_visible("a\\b\t\r"), "a\\\\b\\t\\r");
     }
 }
