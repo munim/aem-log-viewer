@@ -144,7 +144,7 @@ fn io_err(err: impl ToString) -> Error {
 }
 
 #[derive(Debug)]
-struct App {
+pub(super) struct App {
     view: View,
     sort: SortColumn,
     screen: Screen,
@@ -163,7 +163,7 @@ struct App {
 }
 
 impl App {
-    fn new(snapshot: Snapshot) -> Self {
+    pub(super) fn new(snapshot: Snapshot) -> Self {
         let mut app = Self {
             view: View::Volume,
             sort: View::Volume.default_sort(),
@@ -426,7 +426,7 @@ impl App {
         }
     }
 
-    fn handle(&mut self, key: KeyEvent) -> bool {
+    pub(super) fn handle(&mut self, key: KeyEvent) -> bool {
         if key.kind != KeyEventKind::Press && key.kind != KeyEventKind::Repeat {
             return false;
         }
@@ -815,7 +815,18 @@ fn run_ui(session: &mut LiveSession, guard: &mut TerminalGuard) -> UiOutcome {
                         session.request_stop();
                         return restore_and_quit(guard);
                     }
-                    dirty = true;
+                    if let Err(err) = guard
+                        .terminal
+                        .draw(|frame| render(frame, &app))
+                        .map_err(io_err)
+                    {
+                        session.request_stop();
+                        session.kill_orphans();
+                        let _ = guard.restore();
+                        return UiOutcome::Failed(err);
+                    }
+                    last_draw = Instant::now();
+                    dirty = false;
                 }
                 Ok(Event::Resize(_, _)) => dirty = true,
                 Ok(_) => {}
@@ -852,7 +863,7 @@ fn restore_and_quit(guard: &mut TerminalGuard) -> UiOutcome {
     }
 }
 
-fn render(frame: &mut ratatui::Frame<'_>, app: &App) {
+pub(super) fn render(frame: &mut ratatui::Frame<'_>, app: &App) {
     let area = frame.area();
     if app.too_small(area) {
         render_resize_gate(frame, area, app.color);

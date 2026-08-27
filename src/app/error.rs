@@ -2,7 +2,7 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
-pub(crate) enum Error {
+pub enum Error {
     #[error("program ID must be a non-empty string")]
     EmptyProgramId,
     #[error("environment ID must be a non-empty string")]
@@ -42,7 +42,7 @@ pub(crate) enum Error {
 }
 
 impl Error {
-    pub(crate) fn exit_code(&self) -> ExitCode {
+    pub fn exit_code(&self) -> ExitCode {
         match self {
             Self::Internal(_) | Self::Spawn(_) | Self::Io(_) | Self::UnexpectedEnd(_) => {
                 ExitCode::from(1)

@@ -138,6 +138,23 @@ pub(super) struct Request {
     pub(super) tuning: super::tuning::Tuning,
 }
 
+impl Request {
+    pub(super) fn harness() -> Self {
+        Self {
+            program_id: "p1".into(),
+            environment_id: "e1".into(),
+            service: Service::Author,
+            levels: vec![Level::Error, Level::Warn],
+            ims_context: None,
+            config: None,
+            timezone: Timezone::Utc,
+            json: true,
+            raw_sample: false,
+            tuning: super::tuning::Tuning::default(),
+        }
+    }
+}
+
 impl Service {
     pub(super) fn as_str(self) -> &'static str {
         match self {
