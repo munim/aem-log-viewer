@@ -49,13 +49,9 @@ pub(super) struct GroupAggregate {
     #[cfg_attr(not(test), allow(dead_code))]
     pub nodes_capped: bool,
     pub sample: String,
-    #[cfg_attr(not(test), allow(dead_code))]
     pub sample_available: bool,
-    #[cfg_attr(not(test), allow(dead_code))]
     pub sample_truncated: bool,
-    #[cfg_attr(not(test), allow(dead_code))]
     pub sample_original_bytes: usize,
-    #[cfg_attr(not(test), allow(dead_code))]
     pub sample_original_lines: usize,
     pub muted: bool,
     pub level: Level,
