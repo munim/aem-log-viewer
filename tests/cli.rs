@@ -317,6 +317,45 @@ fn example_toml_is_accepted_unchanged() {
 }
 
 #[test]
+fn automatic_cwd_example_toml_is_accepted() {
+    let isolate = Isolate::new();
+    let example = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("aemlog.example.toml");
+    fs::copy(&example, isolate.cwd.join("aemlog.toml")).expect("copy example");
+    let output = isolate.run(&[
+        "--program-id",
+        "p1",
+        "--environment-id",
+        "e1",
+        "--service",
+        "author",
+        "--json",
+    ]);
+    assert_eq!(output.status.code(), Some(1), "stderr={}", stderr(&output));
+    assert!(stderr(&output).contains("aio"), "{}", stderr(&output));
+}
+
+#[test]
+fn automatic_invalid_home_toml_exits_2() {
+    let isolate = Isolate::new();
+    fs::write(isolate.home.join("aemlog.toml"), "timezone = \"utc\"\n").expect("write");
+    let output = isolate.run(&[
+        "--program-id",
+        "p1",
+        "--environment-id",
+        "e1",
+        "--service",
+        "author",
+        "--json",
+    ]);
+    assert_eq!(output.status.code(), Some(2), "stderr={}", stderr(&output));
+    let err = stderr(&output);
+    assert!(
+        err.contains("version is required; expected version = 1"),
+        "{err}"
+    );
+}
+
+#[test]
 fn missing_version_exits_2_with_exact_diagnostic() {
     let isolate = Isolate::new();
     let config = isolate.cwd.join("no-version.toml");

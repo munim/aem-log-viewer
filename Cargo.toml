@@ -2,7 +2,7 @@
 name = "aem-log-analyzer"
 version = "0.1.0"
 edition = "2021"
-rust-version = "1.80"
+rust-version = "1.85"
 description = "Group live AEM as a Cloud Service error-log events"
 publish = false
 default-run = "aemlog"

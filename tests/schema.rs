@@ -50,16 +50,45 @@ fn valid_fixtures_conform() {
     }
 }
 
+fn intended_reason(name: &str) -> &'static [&'static str] {
+    match name {
+        "additional_property.json" => &["additionalProperties", "extra"],
+        "missing_required.json" => &["required", "levels"],
+        "non_finite_rate.json" => &["maximum", "fast_rate"],
+        "unknown_type.json" => &["/type", "const"],
+        "wrong_field_type.json" => &["type", "group_id"],
+        other => panic!("unmapped invalid fixture {other}"),
+    }
+}
+
+fn evaluation_errors(validator: &jsonschema::Validator, value: &serde_json::Value) -> Vec<String> {
+    validator
+        .evaluate(value)
+        .iter_errors()
+        .map(|err| {
+            format!(
+                "{} @ {} :: {}",
+                err.schema_location, err.instance_location, err.error
+            )
+        })
+        .collect()
+}
+
 #[test]
 fn invalid_fixtures_are_rejected() {
     let validator = validator();
     let fixtures = load_dir("invalid");
     assert_eq!(fixtures.len(), 5);
     for (name, value) in fixtures {
-        assert!(
-            !validator.is_valid(&value),
-            "{name} should be rejected by aemlog-v1"
-        );
+        let errors = evaluation_errors(&validator, &value);
+        assert!(!errors.is_empty(), "{name} should be rejected by aemlog-v1");
+        let needles = intended_reason(&name);
+        for needle in needles {
+            assert!(
+                errors.iter().any(|err| err.contains(needle)),
+                "{name} should fail for {needle}; errors={errors:?}"
+            );
+        }
     }
 }
 
