@@ -8,20 +8,22 @@ use crossterm::terminal::{
 };
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Layout, Rect};
-use ratatui::style::{Modifier, Style};
+use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Cell, Clear, Paragraph, Row, Table, TableState};
+use ratatui::widgets::{Block, Borders, Cell, Clear, Paragraph, Row, Table, TableState, Wrap};
 use ratatui::Terminal;
 use regex::RegexBuilder;
 
-use super::cli::Request;
-use super::live::{GroupAggregate, LiveSession, Snapshot};
+use super::cli::{Level, Request};
+use super::live::{GroupAggregate, LiveSession, OverflowState, ProcessState, Snapshot};
 use super::rate::{SortColumn, View};
 use super::Error;
 
 const MIN_FRAME: Duration = Duration::from_millis(80);
 const POLL: Duration = Duration::from_millis(50);
 const MAX_SEARCH_BYTES: usize = 256;
+const MIN_COLS: u16 = 80;
+const MIN_ROWS: u16 = 24;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Screen {
@@ -107,6 +109,7 @@ struct App {
     search: SearchMode,
     pending_mutes: Vec<u64>,
     desired_mute: Option<(u64, bool)>,
+    color: bool,
 }
 
 impl App {
@@ -124,6 +127,7 @@ impl App {
             search: SearchMode::Inactive,
             pending_mutes: Vec::new(),
             desired_mute: None,
+            color: colors_enabled(),
         };
         app.sync_selection();
         app
@@ -487,6 +491,119 @@ impl App {
             },
         }
     }
+
+    fn too_small(&self, area: Rect) -> bool {
+        area.width < MIN_COLS || area.height < MIN_ROWS
+    }
+}
+
+fn colors_enabled() -> bool {
+    std::env::var_os("NO_COLOR").is_none()
+}
+
+fn theme_color(enabled: bool, color: Color) -> Style {
+    if enabled {
+        Style::new().fg(color)
+    } else {
+        Style::new()
+    }
+}
+
+fn role_error(enabled: bool) -> Style {
+    theme_color(enabled, Color::Red)
+}
+
+fn role_warning(enabled: bool) -> Style {
+    theme_color(enabled, Color::Yellow)
+}
+
+fn role_success(enabled: bool) -> Style {
+    theme_color(enabled, Color::Green)
+}
+
+fn role_info(enabled: bool) -> Style {
+    theme_color(enabled, Color::Cyan)
+}
+
+fn role_muted(enabled: bool) -> Style {
+    theme_color(enabled, Color::DarkGray).add_modifier(Modifier::DIM)
+}
+
+fn role_emphasis() -> Style {
+    Style::new().add_modifier(Modifier::BOLD)
+}
+
+fn role_selection() -> Style {
+    Style::new().add_modifier(Modifier::REVERSED | Modifier::BOLD)
+}
+
+fn level_style(level: Level, enabled: bool) -> Style {
+    match level {
+        Level::Fatal | Level::Error => role_error(enabled).add_modifier(Modifier::BOLD),
+        Level::Warn => role_warning(enabled),
+        Level::Info => role_info(enabled),
+        Level::Debug | Level::Trace => role_muted(enabled),
+    }
+}
+
+fn process_style(state: ProcessState, enabled: bool) -> Style {
+    match state {
+        ProcessState::Starting => role_warning(enabled),
+        ProcessState::AioRunning => role_success(enabled),
+        ProcessState::Ended => role_muted(enabled),
+    }
+}
+
+fn overflow_style(state: OverflowState, enabled: bool) -> Style {
+    match state {
+        OverflowState::None => role_muted(enabled),
+        OverflowState::Events(_) => role_error(enabled).add_modifier(Modifier::BOLD),
+    }
+}
+
+fn process_cue(state: ProcessState) -> &'static str {
+    match state {
+        ProcessState::Starting => "...",
+        ProcessState::AioRunning => "ok",
+        ProcessState::Ended => "end",
+    }
+}
+
+fn overflow_cue(state: OverflowState) -> &'static str {
+    match state {
+        OverflowState::None => "ok",
+        OverflowState::Events(_) => "!",
+    }
+}
+
+fn mute_cue(muted: bool) -> &'static str {
+    if muted {
+        "[M]"
+    } else {
+        "   "
+    }
+}
+
+fn trend_cue(group: &GroupAggregate, snapshot: &Snapshot) -> &'static str {
+    let snap = group.rate_snapshot();
+    if snap.is_increasing(snapshot.now, &snapshot.rate_params) {
+        "^"
+    } else if snap.is_new(snapshot.now, &snapshot.rate_params) {
+        "+"
+    } else {
+        " "
+    }
+}
+
+fn level_cue(level: Level) -> &'static str {
+    match level {
+        Level::Fatal => "!!",
+        Level::Error => "E ",
+        Level::Warn => "W ",
+        Level::Info => "I ",
+        Level::Debug => "D ",
+        Level::Trace => "T ",
+    }
 }
 
 pub(super) fn run(request: &Request) -> Result<(), Error> {
@@ -557,37 +674,90 @@ fn run_ui(session: &LiveSession) -> Result<(), Error> {
 
 fn render(frame: &mut ratatui::Frame<'_>, app: &App) {
     let area = frame.area();
+    if app.too_small(area) {
+        render_resize_gate(frame, area, app.color);
+        return;
+    }
     let [header, body, footer] = Layout::vertical([
         Constraint::Length(3),
         Constraint::Fill(1),
         Constraint::Length(1),
     ])
     .areas(area);
-    frame.render_widget(Paragraph::new(header_text(app)), header);
+    frame.render_widget(Paragraph::new(header_line(app)), header);
     match app.screen {
         Screen::Volume => render_table(frame, body, app),
         Screen::Detail => render_detail(frame, body, app),
     }
     frame.render_widget(Paragraph::new(app.footer()), footer);
     if app.help {
-        render_help(frame, area);
+        render_help(frame, area, app);
     }
 }
 
-fn header_text(app: &App) -> String {
+fn render_resize_gate(frame: &mut ratatui::Frame<'_>, area: Rect, color: bool) {
+    let message = vec![
+        Line::from(format!(
+            "terminal too small ({}x{}).",
+            area.width, area.height
+        )),
+        Line::from(format!("resize to {MIN_COLS}x{MIN_ROWS} or larger.")),
+        Line::from("ingestion continues."),
+    ];
+    frame.render_widget(
+        Paragraph::new(message).wrap(Wrap { trim: true }).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title("resize")
+                .style(role_warning(color)),
+        ),
+        area,
+    );
+}
+
+fn header_line(app: &App) -> Line<'static> {
     let snapshot = &app.snapshot;
-    format!(
-        "{}  {}  {}  |  {}  |  up {}  |  events {}  |  groups {}  |  overflow {}  |  diag {}",
-        snapshot.program_id,
-        snapshot.environment_id,
-        snapshot.service,
-        snapshot.process.label(),
-        format_uptime(snapshot.started_at.elapsed()),
-        snapshot.selected_events,
-        snapshot.group_count(),
-        snapshot.overflow.label(),
-        snapshot.diagnostics,
-    )
+    let color = app.color;
+    Line::from(vec![
+        Span::styled(snapshot.program_id.clone(), role_emphasis()),
+        Span::raw("  "),
+        Span::raw(snapshot.environment_id.clone()),
+        Span::raw("  "),
+        Span::raw(snapshot.service.clone()),
+        Span::raw("  |  "),
+        Span::styled(
+            format!(
+                "{} {}",
+                process_cue(snapshot.process),
+                snapshot.process.label()
+            ),
+            process_style(snapshot.process, color),
+        ),
+        Span::raw(format!(
+            "  |  up {}  |  events {}  |  groups {}  |  overflow ",
+            format_uptime(snapshot.started_at.elapsed()),
+            snapshot.selected_events,
+            snapshot.group_count(),
+        )),
+        Span::styled(
+            format!(
+                "{} {}",
+                overflow_cue(snapshot.overflow),
+                snapshot.overflow.label()
+            ),
+            overflow_style(snapshot.overflow, color),
+        ),
+        Span::raw(format!("  |  diag {}", snapshot.diagnostics)),
+    ])
+}
+
+#[cfg(test)]
+fn header_text(app: &App) -> String {
+    header_line(app)
+        .spans
+        .iter()
+        .map(|span| span.content.as_ref())
+        .collect::<String>()
 }
 
 fn view_tabs(active: View) -> String {
@@ -615,16 +785,22 @@ fn render_table(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
         plan.iter()
             .map(|col| Cell::from(sort_header(col.0, app.sort))),
     )
-    .style(Style::new().add_modifier(Modifier::BOLD));
+    .style(role_emphasis());
     let rows: Vec<Row> = app
         .rows()
         .into_iter()
         .map(|group| {
+            let muted = group.muted;
             Row::new(
                 plan.iter()
-                    .map(|col| Cell::from(cell_value(col.0, group)))
+                    .map(|col| cell_widget(col.0, group, app))
                     .collect::<Vec<_>>(),
             )
+            .style(if muted {
+                role_muted(app.color)
+            } else {
+                Style::new()
+            })
         })
         .collect();
     let widths: Vec<Constraint> = plan.iter().map(|col| col.1).collect();
@@ -635,7 +811,7 @@ fn render_table(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
             view_tabs(app.view),
             app.sort.label()
         )))
-        .row_highlight_style(Style::new().add_modifier(Modifier::REVERSED | Modifier::BOLD))
+        .row_highlight_style(role_selection())
         .highlight_symbol("> ");
     let mut state = TableState::default();
     state.select(app.selected_index());
@@ -644,11 +820,12 @@ fn render_table(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
 
 fn column_plan(width: u16) -> Vec<(&'static str, Constraint)> {
     let mut cols = vec![
+        ("MARK", Constraint::Length(5)),
         ("RATE", Constraint::Length(7)),
         ("COUNT", Constraint::Length(7)),
-        ("LEVEL", Constraint::Length(5)),
+        ("LEVEL", Constraint::Length(8)),
     ];
-    if width >= 80 {
+    if width >= 90 {
         cols.push(("LOGGER", Constraint::Length(18)));
     }
     if width >= 100 {
@@ -663,6 +840,9 @@ fn column_plan(width: u16) -> Vec<(&'static str, Constraint)> {
 }
 
 fn sort_header(column: &str, sort: SortColumn) -> String {
+    if column == "MARK" {
+        return String::new();
+    }
     if column == sort.label() {
         format!("*{column}")
     } else {
@@ -687,6 +867,46 @@ fn cell_value(column: &str, group: &super::live::GroupAggregate) -> String {
     }
 }
 
+fn cell_widget(column: &str, group: &GroupAggregate, app: &App) -> Cell<'static> {
+    match column {
+        "MARK" => {
+            let mute = mute_cue(group.muted);
+            let trend = trend_cue(group, &app.snapshot);
+            Cell::from(Line::from(vec![
+                Span::styled(
+                    mute.to_owned(),
+                    if group.muted {
+                        role_muted(app.color)
+                    } else {
+                        Style::new()
+                    },
+                ),
+                Span::styled(
+                    trend.to_owned(),
+                    if trend == "^" {
+                        role_warning(app.color)
+                    } else if trend == "+" {
+                        role_info(app.color)
+                    } else {
+                        Style::new()
+                    },
+                ),
+            ]))
+        }
+        "LEVEL" => Cell::from(Line::from(vec![
+            Span::styled(
+                level_cue(group.level).to_owned(),
+                level_style(group.level, app.color),
+            ),
+            Span::styled(
+                group.level.as_str().to_owned(),
+                level_style(group.level, app.color),
+            ),
+        ])),
+        _ => Cell::from(cell_value(column, group)),
+    }
+}
+
 fn render_detail(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
     let Some(group) = app.selected_group() else {
         frame.render_widget(
@@ -700,7 +920,13 @@ fn render_detail(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
         .into_iter()
         .map(Line::from)
         .collect();
-    let title = format!("detail {}  {}", group.id, evidence_status(group));
+    let title = format!(
+        "detail {}  {}{}  {}",
+        group.id,
+        mute_cue(group.muted).trim(),
+        if group.muted { " " } else { "" },
+        evidence_status(group)
+    );
     let block = Block::default().borders(Borders::ALL).title(title);
     let inner = block.inner(area);
     frame.render_widget(block, area);
@@ -821,31 +1047,51 @@ fn escape_visible(input: &str) -> String {
     out
 }
 
-fn render_help(frame: &mut ratatui::Frame<'_>, area: Rect) {
-    let width = area.width.clamp(24, 56);
-    let height = area.height.saturating_sub(2).clamp(8, 16);
+fn render_help(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
+    let width = area.width.clamp(40, 72);
+    let height = area.height.saturating_sub(2).clamp(12, 22);
     let x = area.x + (area.width.saturating_sub(width)) / 2;
     let y = area.y + (area.height.saturating_sub(height)) / 2;
     let rect = Rect::new(x, y, width, height);
+    let sorts = app
+        .view
+        .sorts()
+        .iter()
+        .map(|col| col.label())
+        .collect::<Vec<_>>()
+        .join(", ");
     let text = vec![
-        Line::from(Span::styled(
-            "keys",
-            Style::new().add_modifier(Modifier::BOLD),
+        Line::from(Span::styled("keys", role_emphasis())),
+        Line::from("j/k, down/up  move list or scroll detail"),
+        Line::from("h/l, left/right  pan detail"),
+        Line::from("Tab  next view: Volume, New, Increasing, Muted"),
+        Line::from("s  cycle sort for the current view"),
+        Line::from("m  mute or unmute selected group"),
+        Line::from("Enter  open group detail"),
+        Line::from("Esc  close help, cancel search, or leave detail"),
+        Line::from("/  search metadata in detail"),
+        Line::from("?  toggle help"),
+        Line::from("q  quit; Ctrl+C also quits and restores the terminal"),
+        Line::from(Span::styled("search", role_emphasis())),
+        Line::from("substring, case-insensitive, metadata only"),
+        Line::from("prefix re: for regex; 256-byte cap; invalid stays on detail"),
+        Line::from(Span::styled("sort and mute", role_emphasis())),
+        Line::from(format!(
+            "view {}  sort {}  cycle {}",
+            app.view.label(),
+            app.sort.label(),
+            sorts
         )),
-        Line::from("j/k, ↓/↑  move or scroll"),
-        Line::from("h/l, ←/→  pan detail"),
-        Line::from("Tab       next view"),
-        Line::from("s         cycle sort"),
-        Line::from("m         mute or unmute"),
-        Line::from("Enter     open detail"),
-        Line::from("Esc       back one level"),
-        Line::from("/         search metadata"),
-        Line::from("?         toggle help"),
-        Line::from("q         quit"),
+        Line::from("muted groups keep ingesting; they leave Volume/New/Increasing"),
+        Line::from("and appear in Muted until unmuted"),
+        Line::from(Span::styled("shutdown", role_emphasis())),
+        Line::from("q or Ctrl+C request shutdown; help keys do not reach the list"),
     ];
     frame.render_widget(Clear, rect);
     frame.render_widget(
-        Paragraph::new(text).block(Block::default().borders(Borders::ALL).title("help")),
+        Paragraph::new(text)
+            .block(Block::default().borders(Borders::ALL).title("help"))
+            .style(role_emphasis()),
         rect,
     );
 }
@@ -1029,7 +1275,8 @@ mod tests {
         assert!(text.contains("author"));
         assert!(text.contains("events 4"));
         assert!(text.contains("groups 1"));
-        assert!(text.contains("overflow none"));
+        assert!(text.contains("overflow"));
+        assert!(text.contains("none"));
         assert!(text.contains("diag 2"));
         assert!(!text.contains("Connected"));
         assert_eq!(view_tabs(View::Volume), "[Volume] New Increasing Muted");
@@ -1064,6 +1311,10 @@ mod tests {
         assert!(help.contains("toggle help"), "{help}");
         assert!(help.contains("quit"), "{help}");
         assert!(help.contains("mute or unmute"), "{help}");
+        assert!(help.contains("substring, case-insensitive"), "{help}");
+        assert!(help.contains("prefix re:"), "{help}");
+        assert!(help.contains("Ctrl+C"), "{help}");
+        assert!(help.contains("Volume, New, Increasing, Muted"), "{help}");
         assert!(text.contains("[Volume]"), "{text}");
         assert!(text.contains("*COUNT"), "{text}");
     }
@@ -1346,5 +1597,213 @@ mod tests {
             missing_text.contains("sample unavailable"),
             "{missing_text}"
         );
+    }
+
+    fn draw_at(app: &App, width: u16, height: u16) -> Terminal<TestBackend> {
+        let backend = TestBackend::new(width, height);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        terminal.draw(|frame| render(frame, app)).expect("draw");
+        terminal
+    }
+
+    fn has_fg(terminal: &Terminal<TestBackend>, color: Color) -> bool {
+        terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .any(|cell| cell.fg == color)
+    }
+
+    fn has_modifier(terminal: &Terminal<TestBackend>, modifier: Modifier) -> bool {
+        terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .any(|cell| cell.modifier.contains(modifier))
+    }
+
+    #[test]
+    fn column_plan_hides_nodes_then_exception_then_logger() {
+        let wide: Vec<&str> = column_plan(120).into_iter().map(|col| col.0).collect();
+        assert!(wide.contains(&"NODES"));
+        assert!(wide.contains(&"EXCEPT"));
+        assert!(wide.contains(&"LOGGER"));
+        assert!(wide.contains(&"COUNT"));
+        assert!(wide.contains(&"RATE"));
+        assert!(wide.contains(&"TEMPLATE"));
+        assert!(wide.contains(&"LAST"));
+        let mid: Vec<&str> = column_plan(100).into_iter().map(|col| col.0).collect();
+        assert!(!mid.contains(&"NODES"));
+        assert!(mid.contains(&"EXCEPT"));
+        assert!(mid.contains(&"LOGGER"));
+        let collapsed: Vec<&str> = column_plan(80).into_iter().map(|col| col.0).collect();
+        assert!(!collapsed.contains(&"NODES"));
+        assert!(!collapsed.contains(&"EXCEPT"));
+        assert!(!collapsed.contains(&"LOGGER"));
+        assert!(collapsed.contains(&"COUNT"));
+        assert!(collapsed.contains(&"RATE"));
+        assert!(collapsed.contains(&"TEMPLATE"));
+        assert!(collapsed.contains(&"LAST"));
+        let mid_logger: Vec<&str> = column_plan(90).into_iter().map(|col| col.0).collect();
+        assert!(mid_logger.contains(&"LOGGER"));
+        assert!(!mid_logger.contains(&"EXCEPT"));
+    }
+
+    #[test]
+    fn pty_sizes_keep_list_and_detail_usable() {
+        let mut rising = group(1, 9, "Failed to start bundle");
+        rising.fast = 10.0;
+        rising.baseline = 1.0;
+        rising.logger = "com.example.LoggerName".into();
+        rising.terminal_exception = Some("java.lang.Boom".into());
+        rising.nodes = vec!["author-0".into(), "author-1".into()];
+        let mut app = App::new(snapshot(vec![rising]));
+        for (w, h) in [(80, 24), (120, 40), (200, 60)] {
+            let list = draw_at(&app, w, h);
+            let text = buffer_text(&list);
+            assert!(text.contains("Failed to start bundle"), "{w}x{h} {text}");
+            assert!(text.contains("COUNT"), "{w}x{h} {text}");
+            assert!(text.contains("[Volume]"), "{w}x{h} {text}");
+            assert!(!text.contains("too small"), "{w}x{h} {text}");
+            if w >= 120 {
+                assert!(text.contains("author-0"), "{w}x{h} {text}");
+            } else {
+                assert!(!text.contains("author-1"), "{w}x{h} {text}");
+            }
+        }
+        app.handle(press(KeyCode::Enter));
+        let detail = draw_at(&app, 80, 24);
+        let text = buffer_text(&detail);
+        assert!(text.contains("detail 1"), "{text}");
+        assert!(text.contains("count 9"), "{text}");
+    }
+
+    #[test]
+    fn below_minimum_shows_resize_gate_and_keeps_state() {
+        let mut app = App::new(snapshot(vec![group(1, 4, "keep me")]));
+        app.handle(press(KeyCode::Enter));
+        app.handle(press(KeyCode::Char('/')));
+        app.handle(press(KeyCode::Char('k')));
+        app.handle(press(KeyCode::Char('e')));
+        app.handle(press(KeyCode::Char('e')));
+        app.handle(press(KeyCode::Char('p')));
+        app.handle(press(KeyCode::Enter));
+        app.handle(press(KeyCode::Char('j')));
+        let selected = app.selected;
+        let view = app.view;
+        let query = match &app.search {
+            SearchMode::Applied { query, .. } => query.clone(),
+            other => panic!("expected applied search, got {other:?}"),
+        };
+        let scroll = app.scroll_y;
+        let small = draw_at(&app, 40, 10);
+        let text = buffer_text(&small);
+        assert!(text.contains("too small"), "{text}");
+        assert!(text.contains("ingestion continues"), "{text}");
+        assert!(!text.contains("keep me"), "{text}");
+        let restored = draw_at(&app, 120, 40);
+        let restored_text = buffer_text(&restored);
+        assert!(restored_text.contains("detail 1"), "{restored_text}");
+        assert!(restored_text.contains("keep"), "{restored_text}");
+        assert_eq!(app.selected, selected);
+        assert_eq!(app.view, view);
+        assert_eq!(app.scroll_y, scroll);
+        match &app.search {
+            SearchMode::Applied { query: again, .. } => assert_eq!(again, &query),
+            other => panic!("search lost after resize, got {other:?}"),
+        }
+        let again_small = draw_at(&app, 79, 23);
+        assert!(buffer_text(&again_small).contains("too small"));
+        let wide = draw_at(&app, 200, 60);
+        assert!(buffer_text(&wide).contains("detail 1"));
+        assert_eq!(app.selected, selected);
+        assert_eq!(app.scroll_y, scroll);
+    }
+
+    #[test]
+    fn no_color_keeps_cues_without_foreground() {
+        let mut rising = group(1, 8, "hot path");
+        rising.fast = 12.0;
+        rising.baseline = 1.0;
+        rising.muted = true;
+        rising.level = Level::Error;
+        let mut app = App::new(snapshot(vec![rising]));
+        app.color = false;
+        app.view = View::Muted;
+        app.sort = View::Muted.default_sort();
+        app.sync_selection();
+        let terminal = draw_at(&app, 120, 24);
+        let text = buffer_text(&terminal);
+        assert!(text.contains("[M]"), "{text}");
+        assert!(text.contains("^") || text.contains("E "), "{text}");
+        assert!(text.contains("ERROR"), "{text}");
+        assert!(has_modifier(&terminal, Modifier::REVERSED));
+        assert!(has_modifier(&terminal, Modifier::BOLD));
+        assert!(!has_fg(&terminal, Color::Red));
+        assert!(!has_fg(&terminal, Color::Yellow));
+        assert!(!has_fg(&terminal, Color::Cyan));
+        assert!(!has_fg(&terminal, Color::Green));
+        assert!(!has_fg(&terminal, Color::DarkGray));
+    }
+
+    #[test]
+    fn color_roles_use_terminal_native_slots() {
+        let mut rising = group(1, 8, "hot path");
+        rising.fast = 12.0;
+        rising.baseline = 1.0;
+        rising.level = Level::Error;
+        let mut ended = snapshot(vec![rising]);
+        ended.process = ProcessState::Ended;
+        ended.overflow = OverflowState::Events(3);
+        let mut app = App::new(ended);
+        app.color = true;
+        let terminal = draw_at(&app, 120, 24);
+        let text = buffer_text(&terminal);
+        assert!(text.contains("E "), "{text}");
+        assert!(
+            text.contains("ok") || text.contains("end") || text.contains("!"),
+            "{text}"
+        );
+        assert!(has_fg(&terminal, Color::Red));
+        assert!(has_modifier(&terminal, Modifier::REVERSED));
+        assert!(has_modifier(&terminal, Modifier::BOLD));
+    }
+
+    #[test]
+    fn help_traps_keys_and_documents_current_view() {
+        let mut app = App::new(snapshot(vec![group(1, 1, "a"), group(2, 1, "b")]));
+        let selected = app.selected;
+        app.handle(press(KeyCode::Char('?')));
+        assert!(app.help);
+        app.handle(press(KeyCode::Char('j')));
+        app.handle(press(KeyCode::Tab));
+        app.handle(press(KeyCode::Char('s')));
+        app.handle(press(KeyCode::Char('m')));
+        app.handle(press(KeyCode::Enter));
+        assert_eq!(app.selected, selected);
+        assert_eq!(app.view, View::Volume);
+        assert_eq!(app.screen, Screen::Volume);
+        assert!(app.pending_mutes.is_empty());
+        let help = draw_at(&app, 120, 40);
+        let text = buffer_text(&help);
+        assert!(
+            text.contains("cycle COUNT, LAST, RATE") || text.contains("COUNT, LAST, RATE"),
+            "{text}"
+        );
+        assert!(text.contains("muted groups keep ingesting"), "{text}");
+        assert!(text.contains("q or Ctrl+C"), "{text}");
+        assert!(!app.handle(press(KeyCode::Char('x'))));
+        assert!(app.handle(press(KeyCode::Char('q'))));
+    }
+
+    #[test]
+    fn run_ui_does_not_enable_mouse_capture() {
+        let src = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/app/tui.rs"));
+        let live = src.split("mod tests").next().expect("source");
+        assert!(!live.contains("EnableMouseCapture"));
+        assert!(!live.contains("DisableMouseCapture"));
+        assert!(!live.contains("MouseEvent"));
     }
 }
