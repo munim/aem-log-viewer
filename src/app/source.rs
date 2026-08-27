@@ -107,7 +107,6 @@ impl Source {
         self.child.stderr.take()
     }
 
-    #[cfg(test)]
     pub(super) fn pgid(&self) -> i32 {
         self.pgid
     }

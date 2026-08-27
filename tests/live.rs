@@ -926,10 +926,332 @@ fn pty_volume_updates_and_q_restores_terminal() {
 
     write_all(&mut master, b"j");
     write_all(&mut master, b"q");
-    let leftover = wait_exit_draining(&mut child, &mut master, Duration::from_secs(5));
+    let leftover = wait_exit_draining(&mut child, &mut master, Duration::from_secs(5), Some(0));
+    assert_restored(&leftover);
+    assert_cooked(&slave_path);
+    assert_subsequent_command(&slave_path);
+}
+
+#[cfg(unix)]
+#[test]
+fn pty_unexpected_aio_exit_freezes_then_enter_exits_1() {
+    let fake = FakeAio::install();
+    fs::write(
+        &fake.logs,
+        "26.08.2026 12:00:00.123 author-0 *ERROR* [FelixDispatchQueue] com.example.Foo Failed to start bundle\n",
+    )
+    .expect("logs");
+    let (mut master, slave_path, mut child) = spawn_tui_pty(
+        &fake,
+        &[
+            ("AEMLOG_FAKE_AIO_LOGS", fake.logs.to_str().unwrap()),
+            (
+                "AEMLOG_FAKE_AIO_STDERR",
+                "secret=supersecret\x1b[31mred\x1b[0m",
+            ),
+            ("AEMLOG_FAKE_AIO_EXIT", "7"),
+        ],
+    );
+    let screen = wait_for_screen(&mut master, |text| {
+        text.contains("source failed") || text.contains("aio status")
+    });
+    assert!(
+        screen.contains("Failed to start bundle") || screen.contains("source failed"),
+        "{screen}"
+    );
+    assert!(
+        screen.contains("7") || screen.contains("aio status"),
+        "{screen}"
+    );
+    assert!(
+        screen.contains("truncated") || screen.contains("complete") || screen.contains("stderr"),
+        "{screen}"
+    );
+    assert!(
+        !screen.contains("\u{1b}[31m"),
+        "raw CSI leaked into overlay\n{screen}"
+    );
+    write_all(&mut master, b"\r");
+    let leftover = wait_exit_draining(&mut child, &mut master, Duration::from_secs(5), Some(1));
+    assert_restored(&leftover);
+    assert_cooked(&slave_path);
+    assert_subsequent_command(&slave_path);
+}
+
+#[cfg(unix)]
+#[test]
+fn pty_ctrl_c_restores_and_reaps_group() {
+    let fake = FakeAio::install();
+    fs::write(
+        &fake.logs,
+        "26.08.2026 12:00:00.123 author-0 *ERROR* [FelixDispatchQueue] com.example.Foo Failed to start bundle\n",
+    )
+    .expect("logs");
+    let (mut master, slave_path, mut child) = spawn_tui_pty(
+        &fake,
+        &[
+            ("AEMLOG_FAKE_AIO_LOGS", fake.logs.to_str().unwrap()),
+            ("AEMLOG_FAKE_AIO_HOLD", "1"),
+            ("AEMLOG_FAKE_AIO_PID", fake.pid_file.to_str().unwrap()),
+            ("AEMLOG_FAKE_AIO_PGID", fake.pgid_file.to_str().unwrap()),
+            (
+                "AEMLOG_FAKE_AIO_DESCENDANT",
+                fake.descendant.to_str().unwrap(),
+            ),
+        ],
+    );
+    wait_for_screen(&mut master, |text| text.contains("Failed to start bundle"));
+    let aio_pid = wait_pid_file(&fake.pid_file);
+    let descendant = wait_pid_file(&fake.descendant);
+    write_all(&mut master, b"\x03");
+    let leftover = wait_exit_draining(&mut child, &mut master, Duration::from_secs(5), Some(0));
+    assert_restored(&leftover);
+    assert_cooked(&slave_path);
+    assert!(!pid_alive(aio_pid), "aio orphaned after ctrl-c");
+    assert!(!pid_alive(descendant), "descendant orphaned after ctrl-c");
+    assert_subsequent_command(&slave_path);
+}
+
+#[cfg(unix)]
+#[test]
+fn pty_sigterm_restores_and_reaps_group() {
+    let fake = FakeAio::install();
+    fs::write(
+        &fake.logs,
+        "26.08.2026 12:00:00.123 author-0 *ERROR* [FelixDispatchQueue] com.example.Foo Failed to start bundle\n",
+    )
+    .expect("logs");
+    let (mut master, slave_path, mut child) = spawn_tui_pty(
+        &fake,
+        &[
+            ("AEMLOG_FAKE_AIO_LOGS", fake.logs.to_str().unwrap()),
+            ("AEMLOG_FAKE_AIO_HOLD", "1"),
+            ("AEMLOG_FAKE_AIO_PID", fake.pid_file.to_str().unwrap()),
+            ("AEMLOG_FAKE_AIO_PGID", fake.pgid_file.to_str().unwrap()),
+            (
+                "AEMLOG_FAKE_AIO_DESCENDANT",
+                fake.descendant.to_str().unwrap(),
+            ),
+        ],
+    );
+    wait_for_screen(&mut master, |text| text.contains("Failed to start bundle"));
+    let aio_pid = wait_pid_file(&fake.pid_file);
+    let descendant = wait_pid_file(&fake.descendant);
+    let status = Command::new("kill")
+        .args(["-TERM", &child.id().to_string()])
+        .status()
+        .expect("kill -TERM");
+    assert!(status.success());
+    let leftover = wait_exit_draining(&mut child, &mut master, Duration::from_secs(5), Some(1));
+    assert_restored(&leftover);
+    assert_cooked(&slave_path);
+    assert!(!pid_alive(aio_pid), "aio orphaned after SIGTERM");
+    assert!(!pid_alive(descendant), "descendant orphaned after SIGTERM");
+}
+
+#[cfg(unix)]
+#[test]
+fn pty_q_reaps_held_aio_group() {
+    let fake = FakeAio::install();
+    fs::write(
+        &fake.logs,
+        "26.08.2026 12:00:00.123 author-0 *ERROR* [FelixDispatchQueue] com.example.Foo Failed to start bundle\n",
+    )
+    .expect("logs");
+    let (mut master, slave_path, mut child) = spawn_tui_pty(
+        &fake,
+        &[
+            ("AEMLOG_FAKE_AIO_LOGS", fake.logs.to_str().unwrap()),
+            ("AEMLOG_FAKE_AIO_HOLD", "1"),
+            ("AEMLOG_FAKE_AIO_PID", fake.pid_file.to_str().unwrap()),
+            ("AEMLOG_FAKE_AIO_PGID", fake.pgid_file.to_str().unwrap()),
+            (
+                "AEMLOG_FAKE_AIO_DESCENDANT",
+                fake.descendant.to_str().unwrap(),
+            ),
+        ],
+    );
+    wait_for_screen(&mut master, |text| text.contains("Failed to start bundle"));
+    let aio_pid = wait_pid_file(&fake.pid_file);
+    let descendant = wait_pid_file(&fake.descendant);
+    write_all(&mut master, b"q");
+    let leftover = wait_exit_draining(&mut child, &mut master, Duration::from_secs(5), Some(0));
+    assert_restored(&leftover);
+    assert_cooked(&slave_path);
+    assert!(!pid_alive(aio_pid), "aio orphaned after q");
+    assert!(!pid_alive(descendant), "descendant orphaned after q");
+    assert_subsequent_command(&slave_path);
+}
+
+#[cfg(unix)]
+#[test]
+fn pty_missing_aio_restores_after_partial_startup() {
+    use std::os::fd::AsRawFd;
+    use std::os::unix::io::FromRawFd;
+    use std::os::unix::process::CommandExt;
+
+    let mut master = posix_openpt().expect("posix_openpt");
+    unlockpt(master.as_raw_fd()).expect("unlockpt");
+    let slave_path = ptsname(master.as_raw_fd()).expect("ptsname");
+    let slave = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&slave_path)
+        .expect("open slave");
+    set_window(master.as_raw_fd(), 120, 40);
+    let slave_fd = slave.as_raw_fd();
+    let stdin_fd = unsafe { libc::dup(slave_fd) };
+    let stdout_fd = unsafe { libc::dup(slave_fd) };
+    let mut cmd = aemlog();
+    cmd.args([
+        "--program-id",
+        "p1",
+        "--environment-id",
+        "e1",
+        "--service",
+        "author",
+    ])
+    .env_clear()
+    .env("PATH", "/usr/bin:/bin")
+    .env("HOME", std::env::temp_dir())
+    .env("TERM", "xterm")
+    .stdin(unsafe { Stdio::from_raw_fd(stdin_fd) })
+    .stdout(unsafe { Stdio::from_raw_fd(stdout_fd) })
+    .stderr(Stdio::piped());
+    let mut child = unsafe {
+        cmd.pre_exec(|| {
+            libc::setsid();
+            libc::ioctl(0, libc::TIOCSCTTY as libc::c_ulong, 0);
+            Ok(())
+        })
+        .spawn()
+        .expect("spawn aemlog on pty")
+    };
+    drop(slave);
+    let leftover = wait_exit_draining(&mut child, &mut master, Duration::from_secs(5), Some(1));
+    assert!(
+        leftover.contains("[?1049l")
+            || leftover.contains("1049l")
+            || leftover.contains("failed to start aio")
+            || leftover.is_empty()
+            || leftover.contains("aio"),
+        "partial startup leftover={leftover:?}"
+    );
+    assert_cooked(&slave_path);
+}
+
+#[cfg(unix)]
+fn spawn_tui_pty(
+    fake: &FakeAio,
+    extra: &[(&str, &str)],
+) -> (std::fs::File, String, std::process::Child) {
+    use std::os::fd::AsRawFd;
+    use std::os::unix::io::FromRawFd;
+    use std::os::unix::process::CommandExt;
+
+    let mut master = posix_openpt().expect("posix_openpt");
+    unlockpt(master.as_raw_fd()).expect("unlockpt");
+    let slave_path = ptsname(master.as_raw_fd()).expect("ptsname");
+    let slave = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&slave_path)
+        .expect("open slave");
+    set_window(master.as_raw_fd(), 120, 40);
+    let slave_fd = slave.as_raw_fd();
+    let stdin_fd = unsafe { libc::dup(slave_fd) };
+    let stdout_fd = unsafe { libc::dup(slave_fd) };
+    assert!(stdin_fd >= 0 && stdout_fd >= 0, "dup slave");
+    let mut cmd = aemlog();
+    cmd.args([
+        "--program-id",
+        "p1",
+        "--environment-id",
+        "e1",
+        "--service",
+        "author",
+    ])
+    .env_clear()
+    .env("PATH", fake.path())
+    .env("HOME", &fake.dir)
+    .env("TERM", "xterm")
+    .env("AEMLOG_FAKE_AIO_RECORD", &fake.record)
+    .stdin(unsafe { Stdio::from_raw_fd(stdin_fd) })
+    .stdout(unsafe { Stdio::from_raw_fd(stdout_fd) })
+    .stderr(Stdio::piped());
+    for (key, value) in extra {
+        cmd.env(*key, *value);
+    }
+    let child = unsafe {
+        cmd.pre_exec(|| {
+            libc::setsid();
+            libc::ioctl(0, libc::TIOCSCTTY as libc::c_ulong, 0);
+            Ok(())
+        })
+        .spawn()
+        .expect("spawn aemlog on pty")
+    };
+    drop(slave);
+    let _ = drain(&mut master);
+    (master, slave_path, child)
+}
+
+#[cfg(unix)]
+fn assert_restored(leftover: &str) {
     assert!(
         leftover.contains("[?1049l") || leftover.contains("1049l"),
         "alternate screen not left\n{leftover:?}"
+    );
+    assert!(
+        leftover.contains("[?25h") || leftover.contains("25h"),
+        "cursor not shown\n{leftover:?}"
+    );
+}
+
+#[cfg(unix)]
+fn assert_cooked(slave_path: &str) {
+    use std::os::fd::AsRawFd;
+    let slave = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(slave_path)
+        .expect("reopen slave");
+    let mut term = unsafe { std::mem::zeroed::<libc::termios>() };
+    assert_eq!(
+        unsafe { libc::tcgetattr(slave.as_raw_fd(), &mut term) },
+        0,
+        "tcgetattr"
+    );
+    assert!(term.c_lflag & libc::ECHO != 0, "ECHO not restored");
+    assert!(term.c_lflag & libc::ICANON != 0, "ICANON not restored");
+}
+
+#[cfg(unix)]
+fn assert_subsequent_command(slave_path: &str) {
+    use std::os::fd::AsRawFd;
+    use std::os::unix::io::FromRawFd;
+    let slave = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(slave_path)
+        .expect("reopen slave");
+    let fd = slave.as_raw_fd();
+    let stdin = unsafe { Stdio::from_raw_fd(libc::dup(fd)) };
+    let output = Command::new("stty")
+        .arg("-a")
+        .stdin(stdin)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .expect("stty");
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        text.split_whitespace().any(|token| token == "echo"),
+        "echo not usable after restore: {text}"
     );
 }
 
@@ -1068,6 +1390,7 @@ fn wait_exit_draining(
     child: &mut std::process::Child,
     master: &mut std::fs::File,
     limit: Duration,
+    expected: Option<i32>,
 ) -> String {
     let deadline = Instant::now() + limit;
     let mut leftover = String::new();
@@ -1076,7 +1399,7 @@ fn wait_exit_draining(
         match child.try_wait() {
             Ok(Some(status)) => {
                 leftover.push_str(&drain(master));
-                assert_eq!(status.code(), Some(0), "aemlog status {status}");
+                assert_eq!(status.code(), expected, "aemlog status {status}");
                 return leftover;
             }
             Ok(None) if Instant::now() >= deadline => {
