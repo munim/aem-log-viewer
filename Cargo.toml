@@ -11,6 +11,10 @@ default-run = "aemlog"
 name = "aemlog"
 path = "src/main.rs"
 
+[[bin]]
+name = "aemlog-perf"
+path = "src/bin/perf.rs"
+
 [dependencies]
 chrono = { version = "0.4.45", default-features = false, features = ["clock", "std"] }
 chrono-tz = "0.10"

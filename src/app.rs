@@ -4,6 +4,7 @@ mod error;
 mod evidence;
 mod frame;
 mod live;
+pub mod perf;
 mod rate;
 mod redact;
 mod source;
@@ -18,9 +19,9 @@ use clap::Parser;
 
 use cli::RawArgs;
 use config::SearchRoots;
-pub(crate) use error::Error;
+pub use error::Error;
 
-pub(crate) fn run() -> Result<(), Error> {
+pub fn run() -> Result<(), Error> {
     execute(RawArgs::parse(), SearchRoots::from_process())
 }
 

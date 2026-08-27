@@ -8,9 +8,7 @@ use chrono::{DateTime, Utc};
 use serde::Serialize;
 use uuid::Uuid;
 
-#[cfg(test)]
-use super::cli::Timezone;
-use super::cli::{Level, Request};
+use super::cli::{Level, Request, Timezone};
 use super::evidence::{self, NodeSet, SampleMeta, SampleStore};
 use super::frame::{self, Frame, Framer};
 use super::rate::{rank_sorted, RateParams, RateSnapshot, RateState, SortColumn, View};
@@ -194,7 +192,7 @@ enum DomainChange {
     },
 }
 
-struct Analyzer {
+pub(super) struct Analyzer {
     session_id: String,
     levels: Vec<Level>,
     groups: HashMap<String, Group>,
@@ -326,7 +324,7 @@ enum Record<'a> {
 }
 
 const STDERR_TAIL: usize = 64 * 1024;
-const PIPE_QUEUE: usize = 16;
+pub(super) const PIPE_QUEUE: usize = 16;
 const UPDATE_COALESCE: Duration = Duration::from_secs(1);
 
 struct StderrTail {
@@ -831,7 +829,7 @@ fn drain_commands(analyzer: &mut Analyzer, commands: &mpsc::Receiver<SessionComm
     changed
 }
 
-fn accept_frames(
+pub(super) fn accept_frames(
     analyzer: &mut Analyzer,
     frames: Vec<Frame>,
     out: &mut impl Write,
@@ -884,6 +882,17 @@ impl Analyzer {
             false,
             &tuning,
         )
+    }
+
+    pub(super) fn for_harness(tuning: &Tuning) -> Self {
+        Self::with_tuning(
+            vec![Level::Error, Level::Warn],
+            TimeInterpreter::new(Timezone::Utc),
+            Redactor::default(),
+            false,
+            tuning,
+        )
+        .with_rate_params(RateParams::from_tuning(tuning))
     }
 
     fn with_tuning(
@@ -947,7 +956,7 @@ impl Analyzer {
         )
     }
 
-    fn ingest(
+    pub(super) fn ingest(
         &mut self,
         event: &str,
         arrived_at: DateTime<Utc>,
@@ -1245,7 +1254,12 @@ impl Analyzer {
         }
     }
 
-    fn snapshot(&self, request: &Request, process: ProcessState, started_at: Instant) -> Snapshot {
+    pub(super) fn snapshot(
+        &self,
+        request: &Request,
+        process: ProcessState,
+        started_at: Instant,
+    ) -> Snapshot {
         let now = self.snapshot_now();
         Snapshot {
             program_id: request.program_id.clone(),
@@ -1423,7 +1437,11 @@ impl Analyzer {
         Ok(())
     }
 
-    fn flush_due_updates(&mut self, now: Instant, out: &mut impl Write) -> Result<(), Error> {
+    pub(super) fn flush_due_updates(
+        &mut self,
+        now: Instant,
+        out: &mut impl Write,
+    ) -> Result<(), Error> {
         let mut due: Vec<u64> = self
             .dirty
             .iter()
@@ -1437,7 +1455,11 @@ impl Analyzer {
         Ok(())
     }
 
-    fn flush_pending_updates(&mut self, now: Instant, out: &mut impl Write) -> Result<(), Error> {
+    pub(super) fn flush_pending_updates(
+        &mut self,
+        now: Instant,
+        out: &mut impl Write,
+    ) -> Result<(), Error> {
         let mut pending: Vec<u64> = self.dirty.iter().copied().collect();
         pending.sort_unstable();
         for group_id in pending {
@@ -1507,12 +1529,39 @@ impl Analyzer {
         super::rate::rank(view, &self.rate_snapshots(now), now, &self.rate_params)
     }
 
-    #[cfg(test)]
-    fn normal_group_count(&self) -> usize {
+    pub(super) fn normal_group_count(&self) -> usize {
         self.groups
             .values()
             .filter(|group| !self.removed.contains(&group.id))
             .count()
+    }
+
+    pub(super) fn selected_events(&self) -> u64 {
+        self.selected_events
+    }
+
+    pub(super) fn overflow_count(&self) -> u64 {
+        self.overflows.values().map(|overflow| overflow.count).sum()
+    }
+
+    pub(super) fn count_checksum(&self) -> u64 {
+        let mut ids: Vec<(u64, u64)> = self
+            .groups
+            .values()
+            .filter(|group| !self.removed.contains(&group.id))
+            .map(|group| (group.id, group.count))
+            .collect();
+        ids.sort_unstable();
+        let mut acc = 0u64;
+        for (id, count) in ids {
+            acc = acc
+                .wrapping_mul(1_000_003)
+                .wrapping_add(id)
+                .wrapping_mul(1_000_003)
+                .wrapping_add(count);
+        }
+        acc.wrapping_mul(1_000_003)
+            .wrapping_add(self.overflow_count())
     }
 
     fn toggle_mute(&mut self, group_id: u64) -> bool {

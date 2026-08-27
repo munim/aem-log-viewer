@@ -104,7 +104,7 @@ impl Framer {
         )
     }
 
-    pub(super) fn with_limits(max_bytes: u64, max_lines: u32, sample_max_bytes: u64) -> Self {
+    pub(crate) fn with_limits(max_bytes: u64, max_lines: u32, sample_max_bytes: u64) -> Self {
         Self {
             buf: Vec::new(),
             pending: None,
@@ -124,7 +124,7 @@ impl Framer {
         }
     }
 
-    pub(super) fn push(&mut self, bytes: &[u8], now: Instant) -> Vec<Frame> {
+    pub(crate) fn push(&mut self, bytes: &[u8], now: Instant) -> Vec<Frame> {
         if bytes.is_empty() {
             return Vec::new();
         }
@@ -153,7 +153,7 @@ impl Framer {
         self.flush_idle()
     }
 
-    pub(super) fn finish(&mut self) -> Vec<Frame> {
+    pub(crate) fn finish(&mut self) -> Vec<Frame> {
         let mut out = Vec::new();
         if !self.buf.is_empty() {
             let tail = std::mem::take(&mut self.buf);
