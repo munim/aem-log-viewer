@@ -1,0 +1,50 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  verify:
+    name: ${{ matrix.os }} rust ${{ matrix.rust }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, ubuntu-latest]
+        rust: ["1.85", "stable"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ matrix.rust }}
+          components: rustfmt, clippy
+      - name: Format
+        run: cargo fmt --all -- --check
+      - name: Clippy
+        run: cargo clippy --all-targets -- -D warnings
+      - name: Test
+        run: cargo test --all-targets
+      - name: Release build
+        run: cargo build --release --bins
+      - name: Schema fixtures
+        run: cargo test --test schema -- --nocapture
+      - name: Fake-AIO live smoke
+        run: cargo test --test live fake_aio -- --nocapture
+      - name: PTY smoke
+        run: cargo test --test live pty_ -- --nocapture
+      - name: Production CLI stays live-AIO only
+        run: cargo test --test perf -- --nocapture
+      - name: Isolated cargo install
+        run: |
+          PREFIX=$(mktemp -d)
+          cargo install --path . --root "$PREFIX" --force
+          "$PREFIX/bin/aemlog" --help
+          set +e
+          "$PREFIX/bin/aemlog"
+          test $? -eq 2
+          "$PREFIX/bin/aemlog" --program-id p1 --environment-id e1 --service author
+          test $? -eq 2

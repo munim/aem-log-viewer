@@ -402,6 +402,103 @@ fn fake_aio_emits_ndjson_session_groups_and_unexpected_end() {
     assert_eq!(fake.stdin_bytes(), 0);
 }
 
+fn merge_bridge_log() -> String {
+    let first = "alpha beta gamma delta epsilon";
+    let second = "alpha other unique novel epsilon";
+    let mut lines = vec![
+        format!(
+            "26.08.2026 12:00:00.000 author-0 *ERROR* [FelixDispatchQueue] com.example.Foo {first}"
+        ),
+        format!(
+            "26.08.2026 12:00:01.000 author-1 *ERROR* [FelixDispatchQueue] com.example.Foo {second}"
+        ),
+    ];
+    for (src, position, replacement, ts, node) in [
+        (first, 1, "BETA", "26.08.2026 12:00:02.000", "author-0"),
+        (first, 2, "GAMMA", "26.08.2026 12:00:03.000", "author-0"),
+        (second, 1, "OTHER", "26.08.2026 12:00:04.000", "author-1"),
+        (second, 2, "UNIQUE", "26.08.2026 12:00:05.000", "author-2"),
+    ] {
+        let mut tokens: Vec<&str> = src.split_whitespace().collect();
+        tokens[position] = replacement;
+        lines.push(format!(
+            "{ts} {node} *ERROR* [FelixDispatchQueue] com.example.Foo {}",
+            tokens.join(" ")
+        ));
+    }
+    lines.push(
+        "26.08.2026 12:00:06.000 author-0 *ERROR* [FelixDispatchQueue] com.example.Secret contact ops@example.com"
+            .into(),
+    );
+    lines.join("\n") + "\n"
+}
+
+#[test]
+fn fake_aio_author_session_merges_updates_and_redacts_unexpected_end() {
+    let fake = FakeAio::install();
+    fs::write(&fake.logs, merge_bridge_log()).expect("logs");
+    let mut cmd = aemlog();
+    cmd.args([
+        "--program-id",
+        "p1",
+        "--environment-id",
+        "e1",
+        "--service",
+        "author",
+        "--json",
+    ])
+    .env_clear()
+    .env("PATH", fake.path())
+    .env("AEMLOG_FAKE_AIO_RECORD", &fake.record)
+    .env("AEMLOG_FAKE_AIO_STDIN_RECORD", &fake.stdin_record)
+    .env("AEMLOG_FAKE_AIO_LOGS", &fake.logs)
+    .env(
+        "AEMLOG_FAKE_AIO_STDERR",
+        "token=supersecret ops@example.com",
+    )
+    .stdin(Stdio::null())
+    .stdout(Stdio::piped())
+    .stderr(Stdio::piped());
+    let output = cmd.output().expect("run aemlog");
+    assert_eq!(output.status.code(), Some(1), "stderr={}", stderr(&output));
+    assert!(
+        stderr(&output).contains("source ended unexpectedly"),
+        "{}",
+        stderr(&output)
+    );
+
+    let recs = json_lines(&output);
+    assert_eq!(recs[0]["type"], "session_started");
+    assert_eq!(recs[0]["source"]["service"], "author");
+    assert_eq!(recs[0]["levels"], serde_json::json!(["ERROR"]));
+    assert!(recs.iter().any(|r| r["type"] == "group_created"));
+    let merged = recs
+        .iter()
+        .find(|r| r["type"] == "group_merged")
+        .expect("group_merged");
+    assert_eq!(merged["group_id"], 1);
+    assert_eq!(merged["removed_id"], 2);
+    assert!(merged["fast_rate"].as_f64().unwrap().is_finite());
+    assert!(merged["baseline_rate"].as_f64().unwrap().is_finite());
+    assert_eq!(merged["count"], 6);
+    assert_eq!(merged["template"], "alpha <*> <*> <*> epsilon");
+    let secret = recs
+        .iter()
+        .find(|r| r["type"] == "group_created" && r["logger"] == "com.example.Secret")
+        .expect("secret group");
+    let sample = secret["sample"].as_str().unwrap();
+    assert!(!sample.contains("ops@example.com"), "{sample}");
+    assert!(sample.contains("[REDACTED:email]"), "{sample}");
+    let last = recs.last().unwrap();
+    assert_eq!(last["type"], "source_ended");
+    assert_eq!(last["status"], 0);
+    let ended = last["stderr"].as_str().unwrap();
+    assert!(!ended.contains("supersecret"), "{ended}");
+    assert!(!ended.contains("ops@example.com"), "{ended}");
+    assert!(ended.contains("[REDACTED:token]"), "{ended}");
+    assert!(ended.contains("[REDACTED:email]"), "{ended}");
+}
+
 #[test]
 fn literal_shell_metacharacters_and_ims_context_reach_child() {
     let fake = FakeAio::install();
@@ -934,6 +1031,105 @@ fn pty_volume_updates_and_q_restores_terminal() {
 
 #[cfg(unix)]
 #[test]
+fn pty_volume_detail_search_views_mute_help_resize_and_q_restore() {
+    let fake = FakeAio::install();
+    fs::write(
+        &fake.logs,
+        "\
+26.08.2026 12:00:00.123 author-0 *ERROR* [FelixDispatchQueue] com.example.Foo Failed to start bundle
+26.08.2026 12:00:00.456 author-0 *ERROR* [FelixDispatchQueue] com.example.Foo Failed to start bundle
+26.08.2026 12:00:01.001 author-0 *ERROR* [FelixDispatchQueue] com.example.Baz other error
+",
+    )
+    .expect("logs");
+    let (mut master, slave_path, mut child) = spawn_tui_pty(
+        &fake,
+        &[
+            ("AEMLOG_FAKE_AIO_LOGS", fake.logs.to_str().unwrap()),
+            ("AEMLOG_FAKE_AIO_HOLD", "1"),
+        ],
+    );
+    let volume = wait_for_screen(&mut master, |text| {
+        screen_has(text, "Failed to start bundle") && screen_has(text, "[Volume]")
+    });
+    assert!(screen_has(&volume, "Volume"), "{volume}");
+    assert!(screen_has(&volume, "COUNT"), "{volume}");
+
+    write_all(&mut master, b"\r");
+    let detail = wait_for_screen(&mut master, |text| screen_has(text, "detail 1"));
+    assert!(screen_has(&detail, "Failed to start bundle"), "{detail}");
+    assert!(screen_has(&detail, "count"), "{detail}");
+
+    write_all(&mut master, b"/Failed\r");
+    let searched = wait_for_screen(&mut master, |text| screen_has(text, "match"));
+    assert!(
+        screen_has(&searched, "Failed") || screen_has(&searched, "id 1"),
+        "{searched}"
+    );
+
+    write_all(&mut master, b"\x1b");
+    wait_for_screen(&mut master, |text| screen_has(text, "[Volume]"));
+
+    write_all(&mut master, b"\t");
+    wait_for_screen(&mut master, |text| screen_has(text, "[New]"));
+    write_all(&mut master, b"\t");
+    wait_for_screen(&mut master, |text| screen_has(text, "[Increasing]"));
+    write_all(&mut master, b"\t");
+    wait_for_screen(&mut master, |text| screen_has(text, "[Muted]"));
+    write_all(&mut master, b"\t");
+    wait_for_screen(&mut master, |text| {
+        screen_has(text, "[Volume]") && screen_has(text, "Failed to start bundle")
+    });
+
+    write_all(&mut master, b"m");
+    write_all(&mut master, b"\t\t\t");
+    let muted = wait_for_screen(&mut master, |text| {
+        screen_has(text, "[Muted]") && screen_has(text, "[M]")
+    });
+    assert!(
+        screen_has(&muted, "Failed to start bundle") || screen_has(&muted, "[M]"),
+        "{muted}"
+    );
+    write_all(&mut master, b"m");
+    write_all(&mut master, b"\t");
+    wait_for_screen(&mut master, |text| {
+        screen_has(text, "[Volume]") && screen_has(text, "Failed to start bundle")
+    });
+
+    write_all(&mut master, b"?");
+    let help = wait_for_screen(&mut master, |text| screen_has(text, "keys"));
+    assert!(
+        screen_has(&help, "mute") || screen_has(&help, "help"),
+        "{help}"
+    );
+    write_all(&mut master, b"\x1b");
+    wait_for_screen(&mut master, |text| screen_has(text, "[j/k]move"));
+
+    {
+        use std::os::fd::AsRawFd;
+        set_window(master.as_raw_fd(), 40, 10);
+    }
+    send_winch(child.id());
+    let small = wait_for_screen(&mut master, |text| screen_has(text, "too small"));
+    assert!(screen_has(&small, "ingestion continues"), "{small}");
+    {
+        use std::os::fd::AsRawFd;
+        set_window(master.as_raw_fd(), 120, 40);
+    }
+    send_winch(child.id());
+    wait_for_screen(&mut master, |text| {
+        screen_has(text, "[Volume]") && screen_has(text, "Failed to start bundle")
+    });
+
+    write_all(&mut master, b"q");
+    let leftover = wait_exit_draining(&mut child, &mut master, Duration::from_secs(5), Some(0));
+    assert_restored(&leftover);
+    assert_cooked(&slave_path);
+    assert_subsequent_command(&slave_path);
+}
+
+#[cfg(unix)]
+#[test]
 fn pty_unexpected_aio_exit_freezes_then_enter_exits_1() {
     let fake = FakeAio::install();
     fs::write(
@@ -1290,6 +1486,15 @@ fn ptsname(fd: i32) -> std::io::Result<String> {
 }
 
 #[cfg(unix)]
+fn send_winch(pid: u32) {
+    let status = Command::new("kill")
+        .args(["-WINCH", &pid.to_string()])
+        .status()
+        .expect("kill -WINCH");
+    assert!(status.success(), "kill -WINCH {pid} failed");
+}
+
+#[cfg(unix)]
 fn set_window(fd: i32, cols: u16, rows: u16) {
     let mut size = libc::winsize {
         ws_row: rows,
@@ -1326,6 +1531,14 @@ fn drain(file: &mut std::fs::File) -> String {
 }
 
 #[cfg(unix)]
+fn compact_text(text: &str) -> String {
+    text.chars().filter(|ch| !ch.is_whitespace()).collect()
+}
+
+fn screen_has(text: &str, needle: &str) -> bool {
+    text.contains(needle) || compact_text(text).contains(&compact_text(needle))
+}
+
 fn wait_for_screen(file: &mut std::fs::File, pred: impl Fn(&str) -> bool) -> String {
     let deadline = Instant::now() + Duration::from_secs(4);
     let mut acc = String::new();
