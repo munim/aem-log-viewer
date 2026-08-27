@@ -13,9 +13,7 @@ use super::cli::Timezone;
 use super::cli::{Level, Request};
 use super::evidence::{self, NodeSet, SampleMeta, SampleStore};
 use super::frame::{self, Frame, Framer};
-use super::rate::{RateParams, RateState};
-#[cfg(test)]
-use super::rate::{RateSnapshot, View};
+use super::rate::{rank_sorted, RateParams, RateSnapshot, RateState, SortColumn, View};
 use super::redact::{RedactedRequestContext, Redactor};
 use super::source;
 use super::template::{BucketKey, TemplateStore};
@@ -36,7 +34,7 @@ struct Group {
     rate: RateState,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub(super) struct GroupAggregate {
     pub id: u64,
     pub count: u64,
@@ -54,6 +52,8 @@ pub(super) struct GroupAggregate {
     pub sample_original_bytes: usize,
     pub sample_original_lines: usize,
     pub muted: bool,
+    pub fast: f64,
+    pub baseline: f64,
     pub level: Level,
     pub logger: String,
     pub terminal_exception: Option<String>,
@@ -63,6 +63,20 @@ pub(super) struct GroupAggregate {
     pub capacity_global: u64,
     #[cfg_attr(not(test), allow(dead_code))]
     pub capacity_template_bucket: u64,
+}
+
+impl GroupAggregate {
+    pub(super) fn rate_snapshot(&self) -> RateSnapshot {
+        RateSnapshot {
+            id: self.id,
+            count: self.count,
+            first_seen: self.first_seen,
+            last_seen: self.last_seen,
+            muted: self.muted,
+            fast: self.fast,
+            baseline: self.baseline,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -126,6 +140,8 @@ pub(super) struct Snapshot {
     pub diagnostics: u64,
     pub overflow: OverflowState,
     pub groups: Vec<GroupAggregate>,
+    pub now: DateTime<Utc>,
+    pub rate_params: RateParams,
     pub generation: u64,
 }
 
@@ -134,19 +150,27 @@ impl Snapshot {
         self.groups.len()
     }
 
-    pub(super) fn volume_rows(&self) -> Vec<&GroupAggregate> {
-        let mut rows: Vec<&GroupAggregate> = self.groups.iter().collect();
-        rows.sort_by(|left, right| {
-            right
-                .count
-                .cmp(&left.count)
-                .then_with(|| left.id.cmp(&right.id))
-        });
-        rows
+    pub(super) fn view_rows(&self, view: View, sort: SortColumn) -> Vec<&GroupAggregate> {
+        let snaps: Vec<RateSnapshot> = self
+            .groups
+            .iter()
+            .map(GroupAggregate::rate_snapshot)
+            .collect();
+        let ranked = rank_sorted(view, sort, &snaps, self.now, &self.rate_params);
+        ranked
+            .iter()
+            .filter_map(|ranked| self.groups.iter().find(|group| group.id == ranked.id))
+            .collect()
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug)]
+pub(super) enum SessionCommand {
+    ToggleMute(u64),
+}
+
+#[derive(Clone, Debug, PartialEq)]
+#[allow(clippy::large_enum_variant)]
 enum DomainChange {
     Created {
         group_id: u64,
@@ -515,6 +539,7 @@ pub(super) fn run(request: &Request) -> Result<(), Error> {
 
 pub(super) struct LiveSession {
     snapshots: std::sync::Arc<std::sync::Mutex<Snapshot>>,
+    commands: mpsc::Sender<SessionCommand>,
     stop: std::sync::Arc<AtomicBool>,
     worker: Option<std::thread::JoinHandle<Result<(), Error>>>,
 }
@@ -539,8 +564,11 @@ impl LiveSession {
             diagnostics: 0,
             overflow: OverflowState::None,
             groups: Vec::new(),
+            now: Utc::now(),
+            rate_params: RateParams::from_tuning(&request.tuning),
             generation: 0,
         }));
+        let (commands, command_rx) = mpsc::channel();
         let stop = std::sync::Arc::new(AtomicBool::new(false));
         let published = snapshots.clone();
         let stop_flag = stop.clone();
@@ -548,12 +576,13 @@ impl LiveSession {
             .name("aemlog-ingest".into())
             .spawn(move || {
                 run_live(
-                    request, source, stdout, stderr, published, stop_flag, started_at,
+                    request, source, stdout, stderr, published, command_rx, stop_flag, started_at,
                 )
             })
             .map_err(|err| Error::Io(err.to_string()))?;
         Ok(Self {
             snapshots,
+            commands,
             stop,
             worker: Some(worker),
         })
@@ -564,6 +593,10 @@ impl LiveSession {
             .lock()
             .unwrap_or_else(|err| err.into_inner())
             .clone()
+    }
+
+    pub(super) fn toggle_mute(&self, group_id: u64) {
+        let _ = self.commands.send(SessionCommand::ToggleMute(group_id));
     }
 
     pub(super) fn request_stop(&self) {
@@ -606,12 +639,14 @@ fn publish_snapshot(
     *guard = snapshot;
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_live(
     request: Request,
     mut source: source::Source,
     stdout: std::process::ChildStdout,
     stderr: std::process::ChildStderr,
     snapshots: std::sync::Arc<std::sync::Mutex<Snapshot>>,
+    commands: mpsc::Receiver<SessionCommand>,
     stop: std::sync::Arc<AtomicBool>,
     started_at: Instant,
 ) -> Result<(), Error> {
@@ -667,6 +702,7 @@ fn run_live(
             user_stop = true;
             break;
         }
+        let mut dirty = drain_commands(&mut analyzer, &commands);
         match rx.recv_timeout(STOP_POLL) {
             Ok(Some(chunk)) => {
                 accept_frames_with(
@@ -675,26 +711,43 @@ fn run_live(
                     &mut sink,
                     false,
                 )?;
-                publish_snapshot(&snapshots, analyzer.snapshot(&request, process, started_at));
+                dirty = true;
             }
             Ok(None) => {
                 accept_frames_with(&mut analyzer, framer.finish(), &mut sink, false)?;
+                dirty |= drain_commands(&mut analyzer, &commands);
+                if dirty {
+                    publish_snapshot(&snapshots, analyzer.snapshot(&request, process, started_at));
+                }
                 break;
             }
             Err(mpsc::RecvTimeoutError::Timeout) => {
                 let frames = framer.poll_idle(Instant::now());
                 if !frames.is_empty() {
                     accept_frames_with(&mut analyzer, frames, &mut sink, false)?;
-                    publish_snapshot(&snapshots, analyzer.snapshot(&request, process, started_at));
+                    dirty = true;
                 }
                 if source.try_wait()?.is_some() {
+                    if dirty {
+                        publish_snapshot(
+                            &snapshots,
+                            analyzer.snapshot(&request, process, started_at),
+                        );
+                    }
                     break;
                 }
             }
             Err(mpsc::RecvTimeoutError::Disconnected) => {
                 accept_frames_with(&mut analyzer, framer.finish(), &mut sink, false)?;
+                dirty |= drain_commands(&mut analyzer, &commands);
+                if dirty {
+                    publish_snapshot(&snapshots, analyzer.snapshot(&request, process, started_at));
+                }
                 break;
             }
+        }
+        if dirty {
+            publish_snapshot(&snapshots, analyzer.snapshot(&request, process, started_at));
         }
     }
 
@@ -719,6 +772,18 @@ fn run_live(
                 .unwrap_or_else(|| "signal".into()),
         ))
     }
+}
+
+fn drain_commands(analyzer: &mut Analyzer, commands: &mpsc::Receiver<SessionCommand>) -> bool {
+    let mut changed = false;
+    while let Ok(command) = commands.try_recv() {
+        match command {
+            SessionCommand::ToggleMute(group_id) => {
+                changed |= analyzer.toggle_mute(group_id);
+            }
+        }
+    }
+    changed
 }
 
 fn accept_frames(
@@ -1072,6 +1137,11 @@ impl Analyzer {
     }
 
     fn aggregate(&self, group: &Group) -> GroupAggregate {
+        self.aggregate_at(group, group.latest_effective)
+    }
+
+    fn aggregate_at(&self, group: &Group, now: DateTime<Utc>) -> GroupAggregate {
+        let (fast, baseline) = group.rate.rates_at(now, &self.rate_params);
         GroupAggregate {
             id: group.id,
             count: group.count,
@@ -1091,6 +1161,8 @@ impl Analyzer {
             sample_original_bytes: group.sample.original_bytes,
             sample_original_lines: group.sample.original_lines,
             muted: group.muted,
+            fast,
+            baseline,
             level: group.bucket.level,
             logger: group.bucket.logger.clone(),
             terminal_exception: group.bucket.terminal_exception.clone(),
@@ -1117,6 +1189,8 @@ impl Analyzer {
             sample_original_bytes: 0,
             sample_original_lines: 0,
             muted: false,
+            fast: 0.0,
+            baseline: 0.0,
             level: overflow.level,
             logger: String::new(),
             terminal_exception: None,
@@ -1127,6 +1201,7 @@ impl Analyzer {
     }
 
     fn snapshot(&self, request: &Request, process: ProcessState, started_at: Instant) -> Snapshot {
+        let now = self.snapshot_now();
         Snapshot {
             program_id: request.program_id.clone(),
             environment_id: request.environment_id.clone(),
@@ -1143,17 +1218,28 @@ impl Analyzer {
                     OverflowState::Events(count)
                 }
             },
-            groups: self.visible_groups(),
+            groups: self.visible_groups_at(now),
+            now,
+            rate_params: self.rate_params,
             generation: 0,
         }
     }
 
-    fn visible_groups(&self) -> Vec<GroupAggregate> {
+    fn snapshot_now(&self) -> DateTime<Utc> {
+        self.groups
+            .values()
+            .filter(|group| !self.removed.contains(&group.id))
+            .map(|group| group.latest_effective)
+            .max()
+            .unwrap_or_else(Utc::now)
+    }
+
+    fn visible_groups_at(&self, now: DateTime<Utc>) -> Vec<GroupAggregate> {
         let mut groups: Vec<GroupAggregate> = self
             .groups
             .values()
             .filter(|group| !self.removed.contains(&group.id))
-            .map(|group| self.aggregate(group))
+            .map(|group| self.aggregate_at(group, now))
             .collect();
         groups.sort_by_key(|group| group.id);
         groups
@@ -1162,7 +1248,7 @@ impl Analyzer {
     #[cfg(test)]
     fn snapshot_groups(&self) -> Vec<GroupAggregate> {
         let mut groups: Vec<GroupAggregate> = self
-            .visible_groups()
+            .visible_groups_at(self.snapshot_now())
             .into_iter()
             .chain(self.overflows.values().map(Self::overflow_aggregate))
             .collect();
@@ -1383,8 +1469,24 @@ impl Analyzer {
             .count()
     }
 
+    fn toggle_mute(&mut self, group_id: u64) -> bool {
+        if self.removed.contains(&group_id) {
+            return false;
+        }
+        for group in self.groups.values_mut() {
+            if group.id == group_id {
+                group.muted = !group.muted;
+                return true;
+            }
+        }
+        false
+    }
+
     #[cfg(test)]
     fn mute(&mut self, group_id: u64) {
+        if self.removed.contains(&group_id) {
+            return;
+        }
         for group in self.groups.values_mut() {
             if group.id == group_id {
                 group.muted = true;
@@ -1752,7 +1854,11 @@ mod tests {
         assert_eq!(snap.overflow, OverflowState::Events(1));
         assert_eq!(snap.group_count(), 1);
         assert_eq!(snap.process.label(), "AIO running / awaiting logs");
-        let ids: Vec<u64> = snap.volume_rows().into_iter().map(|g| g.id).collect();
+        let ids: Vec<u64> = snap
+            .view_rows(View::Volume, View::Volume.default_sort())
+            .into_iter()
+            .map(|g| g.id)
+            .collect();
         assert_eq!(ids, [1]);
         assert_eq!(snap.groups[0].count, 2);
         assert_eq!(snap.groups[0].level, Level::Error);
@@ -2153,6 +2259,17 @@ mod tests {
         assert!(snap[0].muted);
         assert!(!analyzer.removed.contains(&1));
         assert!(analyzer.removed.contains(&2));
+        let live = analyzer.snapshot(&request(), ProcessState::AioRunning, Instant::now());
+        assert!(live
+            .view_rows(View::Volume, View::Volume.default_sort())
+            .is_empty());
+        assert_eq!(
+            live.view_rows(View::Muted, View::Muted.default_sort())
+                .iter()
+                .map(|g| g.id)
+                .collect::<Vec<_>>(),
+            [1]
+        );
     }
 
     #[test]
@@ -2456,7 +2573,7 @@ mod tests {
                 .iter()
                 .map(|g| g.id)
                 .collect::<Vec<_>>(),
-            [2, 1]
+            [2]
         );
         assert!(analyzer
             .ranked(
@@ -2471,8 +2588,63 @@ mod tests {
                 .iter()
                 .map(|g| g.id)
                 .collect::<Vec<_>>(),
-            [1, 2]
+            [2]
         );
+        let snap = analyzer.snapshot(&request(), ProcessState::AioRunning, Instant::now());
+        assert_eq!(
+            snap.view_rows(View::Volume, View::Volume.default_sort())
+                .iter()
+                .map(|g| g.id)
+                .collect::<Vec<_>>(),
+            [2]
+        );
+        assert_eq!(
+            snap.view_rows(View::Muted, View::Muted.default_sort())[0].id,
+            1
+        );
+    }
+
+    #[test]
+    fn muted_groups_keep_ingesting_and_toggle_restores() {
+        let mut analyzer = Analyzer::new(vec![Level::Error]);
+        let mut buf = Vec::new();
+        analyzer
+            .ingest(
+                &event("26.08.2026 12:00:00.000", "author-0", "alpha error"),
+                arrival(),
+                Instant::now(),
+                &mut buf,
+            )
+            .unwrap();
+        analyzer.mute(1);
+        analyzer
+            .ingest(
+                &event("26.08.2026 12:00:01.000", "author-0", "alpha error"),
+                arrival(),
+                Instant::now(),
+                &mut buf,
+            )
+            .unwrap();
+        let snap = analyzer.snapshot(&request(), ProcessState::AioRunning, Instant::now());
+        assert_eq!(snap.groups[0].count, 2);
+        assert!(snap.groups[0].muted);
+        assert!(snap
+            .view_rows(View::Volume, View::Volume.default_sort())
+            .is_empty());
+        assert_eq!(
+            snap.view_rows(View::Muted, View::Muted.default_sort())[0].count,
+            2
+        );
+        assert!(analyzer.toggle_mute(1));
+        let restored = analyzer.snapshot(&request(), ProcessState::AioRunning, Instant::now());
+        assert!(!restored.groups[0].muted);
+        assert_eq!(
+            restored.view_rows(View::Volume, View::Volume.default_sort())[0].id,
+            1
+        );
+        assert!(restored
+            .view_rows(View::Muted, View::Muted.default_sort())
+            .is_empty());
     }
 
     fn analyzer_with(

@@ -91,7 +91,6 @@ impl RateState {
 
 /// Snapshot used for New/Increasing/Muted membership and view order.
 #[derive(Clone, Copy, Debug)]
-#[allow(dead_code)]
 pub(super) struct RateSnapshot {
     pub id: u64,
     pub count: u64,
@@ -122,10 +121,18 @@ impl RateSnapshot {
             0.0
         }
     }
+
+    pub(super) fn in_view(&self, view: View, now: DateTime<Utc>, params: &RateParams) -> bool {
+        match view {
+            View::Volume => !self.muted,
+            View::New => !self.muted && self.is_new(now, params),
+            View::Increasing => !self.muted && self.is_increasing(now, params),
+            View::Muted => self.muted,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-#[allow(dead_code)]
 pub(super) enum View {
     Volume,
     New,
@@ -133,9 +140,90 @@ pub(super) enum View {
     Muted,
 }
 
-#[allow(dead_code)]
+impl View {
+    pub(super) const ALL: [View; 4] = [View::Volume, View::New, View::Increasing, View::Muted];
+
+    pub(super) fn label(self) -> &'static str {
+        match self {
+            Self::Volume => "Volume",
+            Self::New => "New",
+            Self::Increasing => "Increasing",
+            Self::Muted => "Muted",
+        }
+    }
+
+    pub(super) fn index(self) -> usize {
+        match self {
+            Self::Volume => 0,
+            Self::New => 1,
+            Self::Increasing => 2,
+            Self::Muted => 3,
+        }
+    }
+
+    pub(super) fn next(self) -> Self {
+        Self::ALL[(self.index() + 1) % Self::ALL.len()]
+    }
+
+    pub(super) fn sorts(self) -> &'static [SortColumn] {
+        match self {
+            Self::Volume | Self::Muted => {
+                &[SortColumn::Count, SortColumn::LastSeen, SortColumn::Fast]
+            }
+            Self::New => &[
+                SortColumn::FirstSeen,
+                SortColumn::Count,
+                SortColumn::LastSeen,
+            ],
+            Self::Increasing => &[SortColumn::Ratio, SortColumn::Fast, SortColumn::Count],
+        }
+    }
+
+    pub(super) fn default_sort(self) -> SortColumn {
+        self.sorts()[0]
+    }
+
+    pub(super) fn next_sort(self, current: SortColumn) -> SortColumn {
+        let cols = self.sorts();
+        let idx = cols.iter().position(|col| *col == current).unwrap_or(0);
+        cols[(idx + 1) % cols.len()]
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum SortColumn {
+    Count,
+    FirstSeen,
+    LastSeen,
+    Fast,
+    Ratio,
+}
+
+impl SortColumn {
+    pub(super) fn label(self) -> &'static str {
+        match self {
+            Self::Count => "COUNT",
+            Self::FirstSeen => "FIRST",
+            Self::LastSeen => "LAST",
+            Self::Fast => "RATE",
+            Self::Ratio => "RATIO",
+        }
+    }
+}
+
+#[cfg(test)]
 pub(super) fn rank(
     view: View,
+    groups: &[RateSnapshot],
+    now: DateTime<Utc>,
+    params: &RateParams,
+) -> Vec<RateSnapshot> {
+    rank_sorted(view, view.default_sort(), groups, now, params)
+}
+
+pub(super) fn rank_sorted(
+    view: View,
+    sort: SortColumn,
     groups: &[RateSnapshot],
     now: DateTime<Utc>,
     params: &RateParams,
@@ -143,23 +231,23 @@ pub(super) fn rank(
     let mut out: Vec<RateSnapshot> = groups
         .iter()
         .copied()
-        .filter(|group| match view {
-            View::Volume => true,
-            View::New => group.is_new(now, params),
-            View::Increasing => group.is_increasing(now, params),
-            View::Muted => group.muted,
-        })
+        .filter(|group| group.in_view(view, now, params))
         .collect();
-    out.sort_by(|a, b| match view {
-        View::Volume | View::Muted => b.count.cmp(&a.count).then(a.id.cmp(&b.id)),
-        View::New => b.first_seen.cmp(&a.first_seen).then(a.id.cmp(&b.id)),
-        View::Increasing => b
+    out.sort_by(|a, b| compare_sort(sort, a, b).then(a.id.cmp(&b.id)));
+    out
+}
+
+fn compare_sort(sort: SortColumn, a: &RateSnapshot, b: &RateSnapshot) -> std::cmp::Ordering {
+    match sort {
+        SortColumn::Count => b.count.cmp(&a.count),
+        SortColumn::FirstSeen => b.first_seen.cmp(&a.first_seen),
+        SortColumn::LastSeen => b.last_seen.cmp(&a.last_seen),
+        SortColumn::Fast => b.fast.total_cmp(&a.fast),
+        SortColumn::Ratio => b
             .ratio()
             .total_cmp(&a.ratio())
-            .then(b.fast.total_cmp(&a.fast))
-            .then(a.id.cmp(&b.id)),
-    });
-    out
+            .then(b.fast.total_cmp(&a.fast)),
+    }
 }
 
 fn impulse(half_life_secs: f64) -> f64 {
@@ -342,8 +430,8 @@ mod tests {
         let now = utc(0);
         let params = params();
         let groups = [
-            snap(3, 10, now, true, 0.0, 0.0),
-            snap(1, 10, now, true, 0.0, 0.0),
+            snap(3, 10, now, false, 0.0, 0.0),
+            snap(1, 10, now, false, 0.0, 0.0),
             snap(2, 20, now, false, 0.0, 0.0),
         ];
         let volume: Vec<u64> = rank(View::Volume, &groups, now, &params)
@@ -351,11 +439,107 @@ mod tests {
             .map(|g| g.id)
             .collect();
         assert_eq!(volume, [2, 1, 3]);
-        let muted: Vec<u64> = rank(View::Muted, &groups, now, &params)
+        let muted_groups = [
+            snap(3, 10, now, true, 0.0, 0.0),
+            snap(1, 10, now, true, 0.0, 0.0),
+            snap(2, 20, now, true, 0.0, 0.0),
+        ];
+        let muted: Vec<u64> = rank(View::Muted, &muted_groups, now, &params)
             .iter()
             .map(|g| g.id)
             .collect();
-        assert_eq!(muted, [1, 3]);
+        assert_eq!(muted, [2, 1, 3]);
+    }
+
+    #[test]
+    fn volume_new_and_increasing_exclude_muted() {
+        let params = params();
+        let first = utc(0);
+        let now = Utc.with_ymd_and_hms(2026, 8, 26, 12, 0, 50).unwrap();
+        let increasing_now = Utc.with_ymd_and_hms(2026, 8, 26, 12, 2, 0).unwrap();
+        let groups = [
+            snap(1, 20, first, true, 10.0, 2.0),
+            snap(2, 5, first, false, 10.0, 2.0),
+        ];
+        assert_eq!(
+            rank(View::Volume, &groups, now, &params)
+                .iter()
+                .map(|g| g.id)
+                .collect::<Vec<_>>(),
+            [2]
+        );
+        assert_eq!(
+            rank(View::New, &groups, now, &params)
+                .iter()
+                .map(|g| g.id)
+                .collect::<Vec<_>>(),
+            [2]
+        );
+        assert_eq!(
+            rank(View::Increasing, &groups, increasing_now, &params)
+                .iter()
+                .map(|g| g.id)
+                .collect::<Vec<_>>(),
+            [2]
+        );
+        assert_eq!(rank(View::Muted, &groups, now, &params)[0].id, 1);
+    }
+
+    #[test]
+    fn alternative_sorts_keep_stable_id_ties() {
+        let params = params();
+        let now = utc(20);
+        let groups = [
+            RateSnapshot {
+                id: 2,
+                count: 4,
+                first_seen: utc(10),
+                last_seen: utc(20),
+                muted: false,
+                fast: 1.0,
+                baseline: 1.0,
+            },
+            RateSnapshot {
+                id: 1,
+                count: 4,
+                first_seen: utc(10),
+                last_seen: utc(20),
+                muted: false,
+                fast: 1.0,
+                baseline: 1.0,
+            },
+            RateSnapshot {
+                id: 3,
+                count: 1,
+                first_seen: utc(5),
+                last_seen: utc(15),
+                muted: false,
+                fast: 3.0,
+                baseline: 1.0,
+            },
+        ];
+        let last: Vec<u64> = rank_sorted(View::Volume, SortColumn::LastSeen, &groups, now, &params)
+            .iter()
+            .map(|g| g.id)
+            .collect();
+        assert_eq!(last, [1, 2, 3]);
+        let fast: Vec<u64> = rank_sorted(View::Volume, SortColumn::Fast, &groups, now, &params)
+            .iter()
+            .map(|g| g.id)
+            .collect();
+        assert_eq!(fast, [3, 1, 2]);
+        assert_eq!(
+            View::Volume.next_sort(SortColumn::Count),
+            SortColumn::LastSeen
+        );
+        assert_eq!(
+            View::New.next_sort(SortColumn::FirstSeen),
+            SortColumn::Count
+        );
+        assert_eq!(
+            View::Increasing.next_sort(SortColumn::Ratio),
+            SortColumn::Fast
+        );
     }
 
     #[test]
