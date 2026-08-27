@@ -16,31 +16,12 @@ use regex::RegexBuilder;
 
 use super::cli::Request;
 use super::live::{GroupAggregate, LiveSession, Snapshot};
+use super::rate::{SortColumn, View};
 use super::Error;
 
 const MIN_FRAME: Duration = Duration::from_millis(80);
 const POLL: Duration = Duration::from_millis(50);
 const MAX_SEARCH_BYTES: usize = 256;
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum View {
-    Volume,
-}
-
-const VIEWS: [View; 1] = [View::Volume];
-
-impl View {
-    fn label(self) -> &'static str {
-        match self {
-            Self::Volume => "Volume",
-        }
-    }
-
-    fn next(self) -> Self {
-        let idx = VIEWS.iter().position(|view| *view == self).unwrap_or(0);
-        VIEWS[(idx + 1) % VIEWS.len()]
-    }
-}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Screen {
@@ -115,26 +96,34 @@ fn io_err(err: impl ToString) -> Error {
 #[derive(Debug)]
 struct App {
     view: View,
+    sort: SortColumn,
     screen: Screen,
     selected: Option<u64>,
+    last_index: usize,
     help: bool,
     snapshot: Snapshot,
     scroll_y: u16,
     scroll_x: u16,
     search: SearchMode,
+    pending_mutes: Vec<u64>,
+    desired_mute: Option<(u64, bool)>,
 }
 
 impl App {
     fn new(snapshot: Snapshot) -> Self {
         let mut app = Self {
             view: View::Volume,
+            sort: View::Volume.default_sort(),
             screen: Screen::Volume,
             selected: None,
+            last_index: 0,
             help: false,
             snapshot,
             scroll_y: 0,
             scroll_x: 0,
             search: SearchMode::Inactive,
+            pending_mutes: Vec::new(),
+            desired_mute: None,
         };
         app.sync_selection();
         app
@@ -142,6 +131,17 @@ impl App {
 
     fn apply_snapshot(&mut self, snapshot: Snapshot) {
         self.snapshot = snapshot;
+        if let Some((id, muted)) = self.desired_mute {
+            if let Some(group) = self.snapshot.groups.iter_mut().find(|group| group.id == id) {
+                if group.muted == muted {
+                    self.desired_mute = None;
+                } else {
+                    group.muted = muted;
+                }
+            } else {
+                self.desired_mute = None;
+            }
+        }
         self.sync_selection();
         if self.screen == Screen::Detail && self.selected_group().is_none() {
             self.close_detail();
@@ -150,9 +150,7 @@ impl App {
     }
 
     fn rows(&self) -> Vec<&GroupAggregate> {
-        match self.view {
-            View::Volume => self.snapshot.volume_rows(),
-        }
+        self.snapshot.view_rows(self.view, self.sort)
     }
 
     fn selected_index(&self) -> Option<usize> {
@@ -172,11 +170,17 @@ impl App {
             return;
         }
         if let Some(id) = self.selected {
-            if rows.iter().any(|group| group.id == id) {
+            if let Some(index) = rows.iter().position(|group| group.id == id) {
+                self.last_index = index;
                 return;
             }
+            let index = self.last_index.min(rows.len() - 1);
+            self.selected = Some(rows[index].id);
+            self.last_index = index;
+            return;
         }
         self.selected = Some(rows[0].id);
+        self.last_index = 0;
     }
 
     fn move_selection(&mut self, delta: isize) {
@@ -191,6 +195,33 @@ impl App {
             .unwrap_or(0);
         let next = (current as isize + delta).clamp(0, rows.len() as isize - 1) as usize;
         self.selected = Some(rows[next].id);
+        self.last_index = next;
+    }
+
+    fn cycle_view(&mut self) {
+        self.view = self.view.next();
+        self.sort = self.view.default_sort();
+        self.sync_selection();
+    }
+
+    fn cycle_sort(&mut self) {
+        self.sort = self.view.next_sort(self.sort);
+        self.sync_selection();
+    }
+
+    fn toggle_mute_selected(&mut self) {
+        let Some(id) = self.selected else {
+            return;
+        };
+        let Some(group) = self.snapshot.groups.iter_mut().find(|group| group.id == id) else {
+            return;
+        };
+        group.muted = !group.muted;
+        self.pending_mutes.push(id);
+        self.desired_mute = Some((id, group.muted));
+        if self.screen != Screen::Detail {
+            self.sync_selection();
+        }
     }
 
     fn open_detail(&mut self) {
@@ -209,6 +240,7 @@ impl App {
         self.scroll_y = 0;
         self.scroll_x = 0;
         self.search = SearchMode::Inactive;
+        self.sync_selection();
     }
 
     fn editing_search(&self) -> bool {
@@ -362,8 +394,15 @@ impl App {
                 false
             }
             KeyCode::Tab => {
-                self.view = self.view.next();
-                self.sync_selection();
+                self.cycle_view();
+                false
+            }
+            KeyCode::Char('s') => {
+                self.cycle_sort();
+                false
+            }
+            KeyCode::Char('m') => {
+                self.toggle_mute_selected();
                 false
             }
             KeyCode::Enter => {
@@ -418,6 +457,10 @@ impl App {
                 self.begin_search();
                 false
             }
+            KeyCode::Char('m') => {
+                self.toggle_mute_selected();
+                false
+            }
             _ => false,
         }
     }
@@ -430,7 +473,10 @@ impl App {
             return format!("/{buffer}");
         }
         match self.screen {
-            Screen::Volume => "[q]uit  [?]help  [j/k]move  [Tab]view  [Enter]detail".into(),
+            Screen::Volume => format!(
+                "[q]uit  [?]help  [j/k]move  [Tab]view  [s]ort  [m]ute  [Enter]detail  sort {}",
+                self.sort.label()
+            ),
             Screen::Detail => match &self.search {
                 SearchMode::Applied { query, regex } if regex.is_some() => {
                     format!("[re:] {query}  [Esc]back")
@@ -472,6 +518,11 @@ fn run_ui(session: &LiveSession) -> Result<(), Error> {
             app.apply_snapshot(snap);
             dirty = true;
         }
+        if !app.pending_mutes.is_empty() {
+            for id in app.pending_mutes.drain(..) {
+                session.toggle_mute(id);
+            }
+        }
         if dirty && last_draw.elapsed() >= MIN_FRAME {
             guard
                 .terminal
@@ -512,7 +563,7 @@ fn render(frame: &mut ratatui::Frame<'_>, app: &App) {
         Constraint::Length(1),
     ])
     .areas(area);
-    frame.render_widget(Paragraph::new(header_text(&app.snapshot)), header);
+    frame.render_widget(Paragraph::new(header_text(app)), header);
     match app.screen {
         Screen::Volume => render_table(frame, body, app),
         Screen::Detail => render_detail(frame, body, app),
@@ -523,7 +574,8 @@ fn render(frame: &mut ratatui::Frame<'_>, app: &App) {
     }
 }
 
-fn header_text(snapshot: &Snapshot) -> String {
+fn header_text(app: &App) -> String {
+    let snapshot = &app.snapshot;
     format!(
         "{}  {}  {}  |  {}  |  up {}  |  events {}  |  groups {}  |  overflow {}  |  diag {}",
         snapshot.program_id,
@@ -538,6 +590,20 @@ fn header_text(snapshot: &Snapshot) -> String {
     )
 }
 
+fn view_tabs(active: View) -> String {
+    View::ALL
+        .iter()
+        .map(|view| {
+            if *view == active {
+                format!("[{}]", view.label())
+            } else {
+                view.label().to_owned()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 fn format_uptime(elapsed: Duration) -> String {
     let secs = elapsed.as_secs();
     format!("{}:{:02}:{:02}", secs / 3600, (secs % 3600) / 60, secs % 60)
@@ -545,8 +611,11 @@ fn format_uptime(elapsed: Duration) -> String {
 
 fn render_table(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
     let plan = column_plan(area.width);
-    let header = Row::new(plan.iter().map(|col| Cell::from(col.0)))
-        .style(Style::new().add_modifier(Modifier::BOLD));
+    let header = Row::new(
+        plan.iter()
+            .map(|col| Cell::from(sort_header(col.0, app.sort))),
+    )
+    .style(Style::new().add_modifier(Modifier::BOLD));
     let rows: Vec<Row> = app
         .rows()
         .into_iter()
@@ -561,11 +630,11 @@ fn render_table(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
     let widths: Vec<Constraint> = plan.iter().map(|col| col.1).collect();
     let table = Table::new(rows, widths)
         .header(header)
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title(app.view.label()),
-        )
+        .block(Block::default().borders(Borders::ALL).title(format!(
+            "{}  *{}",
+            view_tabs(app.view),
+            app.sort.label()
+        )))
         .row_highlight_style(Style::new().add_modifier(Modifier::REVERSED | Modifier::BOLD))
         .highlight_symbol("> ");
     let mut state = TableState::default();
@@ -575,8 +644,8 @@ fn render_table(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
 
 fn column_plan(width: u16) -> Vec<(&'static str, Constraint)> {
     let mut cols = vec![
-        ("RATE", Constraint::Length(6)),
-        ("COUNT", Constraint::Length(6)),
+        ("RATE", Constraint::Length(7)),
+        ("COUNT", Constraint::Length(7)),
         ("LEVEL", Constraint::Length(5)),
     ];
     if width >= 80 {
@@ -593,9 +662,17 @@ fn column_plan(width: u16) -> Vec<(&'static str, Constraint)> {
     cols
 }
 
+fn sort_header(column: &str, sort: SortColumn) -> String {
+    if column == sort.label() {
+        format!("*{column}")
+    } else {
+        column.to_owned()
+    }
+}
+
 fn cell_value(column: &str, group: &super::live::GroupAggregate) -> String {
     match column {
-        "RATE" => "-".into(),
+        "RATE" => format!("{:.2}", group.fast),
         "COUNT" => group.count.to_string(),
         "LEVEL" => group.level.as_str().to_owned(),
         "LOGGER" => group.logger.clone(),
@@ -746,7 +823,7 @@ fn escape_visible(input: &str) -> String {
 
 fn render_help(frame: &mut ratatui::Frame<'_>, area: Rect) {
     let width = area.width.clamp(24, 56);
-    let height = area.height.saturating_sub(2).clamp(8, 14);
+    let height = area.height.saturating_sub(2).clamp(8, 16);
     let x = area.x + (area.width.saturating_sub(width)) / 2;
     let y = area.y + (area.height.saturating_sub(height)) / 2;
     let rect = Rect::new(x, y, width, height);
@@ -757,7 +834,9 @@ fn render_help(frame: &mut ratatui::Frame<'_>, area: Rect) {
         )),
         Line::from("j/k, ↓/↑  move or scroll"),
         Line::from("h/l, ←/→  pan detail"),
-        Line::from("Tab       next available view"),
+        Line::from("Tab       next view"),
+        Line::from("s         cycle sort"),
+        Line::from("m         mute or unmute"),
         Line::from("Enter     open detail"),
         Line::from("Esc       back one level"),
         Line::from("/         search metadata"),
@@ -776,6 +855,7 @@ mod tests {
     use super::*;
     use crate::app::cli::Level;
     use crate::app::live::{GroupAggregate, OverflowState, ProcessState};
+    use crate::app::rate::RateParams;
     use chrono::{TimeZone, Utc};
     use ratatui::backend::TestBackend;
 
@@ -799,6 +879,8 @@ mod tests {
             sample_original_bytes: message.len(),
             sample_original_lines: 1,
             muted: false,
+            fast: 0.0,
+            baseline: 0.0,
             level: Level::Error,
             logger: "com.example.Foo".into(),
             terminal_exception: None,
@@ -808,7 +890,7 @@ mod tests {
         }
     }
 
-    fn snapshot(groups: Vec<GroupAggregate>) -> Snapshot {
+    fn snapshot_at(groups: Vec<GroupAggregate>, now: chrono::DateTime<Utc>) -> Snapshot {
         Snapshot {
             program_id: "p1".into(),
             environment_id: "e1".into(),
@@ -819,8 +901,14 @@ mod tests {
             diagnostics: 2,
             overflow: OverflowState::None,
             groups,
+            now,
+            rate_params: RateParams::default(),
             generation: 1,
         }
+    }
+
+    fn snapshot(groups: Vec<GroupAggregate>) -> Snapshot {
+        snapshot_at(groups, instant())
     }
 
     fn press(code: KeyCode) -> KeyEvent {
@@ -844,7 +932,11 @@ mod tests {
             group(1, 4, "tie"),
             group(3, 9, "hot"),
         ]);
-        let ids: Vec<u64> = snap.volume_rows().into_iter().map(|g| g.id).collect();
+        let ids: Vec<u64> = snap
+            .view_rows(View::Volume, View::Volume.default_sort())
+            .into_iter()
+            .map(|g| g.id)
+            .collect();
         assert_eq!(ids, [3, 1, 2]);
     }
 
@@ -878,8 +970,15 @@ mod tests {
     }
 
     #[test]
-    fn tab_stays_on_only_available_view_and_enter_opens_detail() {
+    fn tab_cycles_fixed_views_and_enter_opens_detail() {
         let mut app = App::new(snapshot(vec![group(1, 1, "a")]));
+        assert_eq!(app.view, View::Volume);
+        app.handle(press(KeyCode::Tab));
+        assert_eq!(app.view, View::New);
+        app.handle(press(KeyCode::Tab));
+        assert_eq!(app.view, View::Increasing);
+        app.handle(press(KeyCode::Tab));
+        assert_eq!(app.view, View::Muted);
         app.handle(press(KeyCode::Tab));
         assert_eq!(app.view, View::Volume);
         let before = app.selected;
@@ -897,9 +996,8 @@ mod tests {
         let mut app = App::new(snapshot(vec![]));
         assert_eq!(
             app.footer(),
-            "[q]uit  [?]help  [j/k]move  [Tab]view  [Enter]detail"
+            "[q]uit  [?]help  [j/k]move  [Tab]view  [s]ort  [m]ute  [Enter]detail  sort COUNT"
         );
-        assert!(!app.footer().contains("Muted"));
         app.handle(press(KeyCode::Char('?')));
         assert!(app.help);
         assert_eq!(app.footer(), "[q]uit  [?]close  [Esc]close");
@@ -924,7 +1022,8 @@ mod tests {
             "AIO running / awaiting logs"
         );
         assert_eq!(ProcessState::Ended.label(), "Ended");
-        let text = header_text(&snapshot(vec![group(1, 4, "boom")]));
+        let app = App::new(snapshot(vec![group(1, 4, "boom")]));
+        let text = header_text(&app);
         assert!(text.contains("p1"));
         assert!(text.contains("e1"));
         assert!(text.contains("author"));
@@ -933,6 +1032,8 @@ mod tests {
         assert!(text.contains("overflow none"));
         assert!(text.contains("diag 2"));
         assert!(!text.contains("Connected"));
+        assert_eq!(view_tabs(View::Volume), "[Volume] New Increasing Muted");
+        assert_eq!(view_tabs(View::New), "Volume [New] Increasing Muted");
     }
 
     #[test]
@@ -962,6 +1063,120 @@ mod tests {
         let help = buffer_text(&terminal);
         assert!(help.contains("toggle help"), "{help}");
         assert!(help.contains("quit"), "{help}");
+        assert!(help.contains("mute or unmute"), "{help}");
+        assert!(text.contains("[Volume]"), "{text}");
+        assert!(text.contains("*COUNT"), "{text}");
+    }
+
+    #[test]
+    fn mute_moves_selected_group_to_muted_view() {
+        let mut app = App::new(snapshot(vec![group(1, 4, "a"), group(2, 2, "b")]));
+        assert_eq!(app.selected, Some(1));
+        app.handle(press(KeyCode::Char('m')));
+        assert_eq!(app.rows().iter().map(|g| g.id).collect::<Vec<_>>(), [2]);
+        assert_eq!(app.selected, Some(2));
+        assert_eq!(app.pending_mutes, [1]);
+        app.pending_mutes.clear();
+        app.handle(press(KeyCode::Tab));
+        app.handle(press(KeyCode::Tab));
+        app.handle(press(KeyCode::Tab));
+        assert_eq!(app.view, View::Muted);
+        assert_eq!(app.rows().iter().map(|g| g.id).collect::<Vec<_>>(), [1]);
+        assert_eq!(app.selected, Some(1));
+        app.handle(press(KeyCode::Char('m')));
+        assert!(app.rows().is_empty());
+        app.handle(press(KeyCode::Tab));
+        assert_eq!(app.view, View::Volume);
+        assert_eq!(app.rows().iter().map(|g| g.id).collect::<Vec<_>>(), [1, 2]);
+    }
+
+    #[test]
+    fn sort_cycles_keep_group_id_and_show_indicator() {
+        let mut a = group(1, 4, "a");
+        a.last_seen = Utc.with_ymd_and_hms(2026, 8, 26, 12, 0, 1).unwrap();
+        a.fast = 1.0;
+        let mut b = group(2, 4, "b");
+        b.last_seen = Utc.with_ymd_and_hms(2026, 8, 26, 12, 0, 9).unwrap();
+        b.fast = 3.0;
+        let mut app = App::new(snapshot(vec![a, b]));
+        assert_eq!(app.rows().iter().map(|g| g.id).collect::<Vec<_>>(), [1, 2]);
+        app.handle(press(KeyCode::Char('j')));
+        assert_eq!(app.selected, Some(2));
+        app.handle(press(KeyCode::Char('s')));
+        assert_eq!(app.sort, SortColumn::LastSeen);
+        assert_eq!(app.rows().iter().map(|g| g.id).collect::<Vec<_>>(), [2, 1]);
+        assert_eq!(app.selected, Some(2));
+        assert!(app.footer().contains("sort LAST"));
+        app.handle(press(KeyCode::Char('s')));
+        assert_eq!(app.sort, SortColumn::Fast);
+        assert_eq!(app.rows().iter().map(|g| g.id).collect::<Vec<_>>(), [2, 1]);
+        let backend = TestBackend::new(120, 24);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        terminal.draw(|frame| render(frame, &app)).expect("draw");
+        let text = buffer_text(&terminal);
+        assert!(text.contains("*RATE"), "{text}");
+        assert!(text.contains("[Volume]"), "{text}");
+        assert!(text.contains("*RATE"), "{text}");
+    }
+
+    #[test]
+    fn view_membership_follows_snapshot_clock_and_predicates() {
+        let now = Utc.with_ymd_and_hms(2026, 8, 26, 12, 2, 0).unwrap();
+        let mut fresh = group(1, 1, "new");
+        fresh.first_seen = Utc.with_ymd_and_hms(2026, 8, 26, 12, 1, 30).unwrap();
+        let mut rising = group(2, 20, "inc");
+        rising.first_seen = Utc.with_ymd_and_hms(2026, 8, 26, 12, 0, 0).unwrap();
+        rising.fast = 10.0;
+        rising.baseline = 2.0;
+        let mut quiet = group(3, 9, "old");
+        quiet.first_seen = Utc.with_ymd_and_hms(2026, 8, 26, 12, 0, 0).unwrap();
+        quiet.fast = 1.0;
+        quiet.baseline = 1.0;
+        let mut app = App::new(snapshot_at(vec![fresh, rising, quiet], now));
+        assert_eq!(
+            app.rows().iter().map(|g| g.id).collect::<Vec<_>>(),
+            [2, 3, 1]
+        );
+        app.handle(press(KeyCode::Tab));
+        assert_eq!(app.view, View::New);
+        assert_eq!(app.rows().iter().map(|g| g.id).collect::<Vec<_>>(), [1]);
+        app.handle(press(KeyCode::Tab));
+        assert_eq!(app.view, View::Increasing);
+        assert_eq!(app.rows().iter().map(|g| g.id).collect::<Vec<_>>(), [2]);
+        let later = Utc.with_ymd_and_hms(2026, 8, 26, 12, 3, 0).unwrap();
+        let mut aged = group(1, 1, "new");
+        aged.first_seen = Utc.with_ymd_and_hms(2026, 8, 26, 12, 1, 30).unwrap();
+        let mut still_rising = group(2, 20, "inc");
+        still_rising.first_seen = Utc.with_ymd_and_hms(2026, 8, 26, 12, 0, 0).unwrap();
+        still_rising.fast = 10.0;
+        still_rising.baseline = 2.0;
+        app.view = View::New;
+        app.sort = View::New.default_sort();
+        app.apply_snapshot(snapshot_at(vec![aged, still_rising], later));
+        assert!(app.rows().is_empty());
+        app.view = View::Increasing;
+        app.sort = View::Increasing.default_sort();
+        app.sync_selection();
+        assert_eq!(app.rows().iter().map(|g| g.id).collect::<Vec<_>>(), [2]);
+    }
+
+    #[test]
+    fn selection_follows_id_through_filter_mute_and_merge() {
+        let mut app = App::new(snapshot(vec![
+            group(1, 5, "a"),
+            group(2, 3, "b"),
+            group(3, 1, "c"),
+        ]));
+        app.handle(press(KeyCode::Char('j')));
+        assert_eq!(app.selected, Some(2));
+        let mut muted = group(2, 8, "b");
+        muted.muted = true;
+        app.apply_snapshot(snapshot(vec![group(1, 5, "a"), muted, group(3, 1, "c")]));
+        assert_eq!(app.selected, Some(3));
+        app.apply_snapshot(snapshot(vec![group(1, 9, "merged"), group(3, 1, "c")]));
+        assert_eq!(app.selected, Some(3));
+        app.apply_snapshot(snapshot(vec![group(1, 9, "merged")]));
+        assert_eq!(app.selected, Some(1));
     }
 
     fn type_query(app: &mut App, query: &str) {
