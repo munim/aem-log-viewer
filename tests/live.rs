@@ -349,15 +349,31 @@ fn fake_aio_emits_ndjson_session_groups_and_unexpected_end() {
     assert_eq!(recs[1]["type"], "group_created");
     assert_eq!(recs[1]["group_id"], 1);
     assert_eq!(recs[1]["count"], 1);
-    assert_eq!(recs[2]["type"], "group_updated");
-    assert_eq!(recs[2]["group_id"], 1);
-    assert_eq!(recs[2]["count"], 2);
-    assert_eq!(recs[3]["type"], "group_created");
-    assert_eq!(recs[3]["group_id"], 2);
+    assert_eq!(recs[1]["sample_truncated"], false);
+    assert!(recs[1]["fast_rate"].as_f64().unwrap().is_finite());
+    let created: Vec<_> = recs
+        .iter()
+        .filter(|r| r["type"] == "group_created")
+        .collect();
+    assert_eq!(created.len(), 2);
+    assert_eq!(created[1]["group_id"], 2);
+    let updates: Vec<_> = recs
+        .iter()
+        .filter(|r| r["type"] == "group_updated")
+        .collect();
+    assert_eq!(updates.len(), 1);
+    assert_eq!(updates[0]["group_id"], 1);
+    assert_eq!(updates[0]["count"], 2);
+    assert!(updates[0].get("sample").is_none());
     let last = recs.last().unwrap();
     assert_eq!(last["type"], "source_ended");
     assert_eq!(last["status"], 0);
     assert_eq!(last["session_id"], session);
+    assert_eq!(last["stderr_truncated"], false);
+    assert!(last["stderr"]
+        .as_str()
+        .unwrap()
+        .contains("AIO_STDERR_MARKER"));
 
     let types: Vec<&str> = recs.iter().map(|r| r["type"].as_str().unwrap()).collect();
     assert_eq!(
@@ -365,8 +381,8 @@ fn fake_aio_emits_ndjson_session_groups_and_unexpected_end() {
         [
             "session_started",
             "group_created",
-            "group_updated",
             "group_created",
+            "group_updated",
             "source_ended"
         ]
     );
@@ -592,6 +608,8 @@ java.lang.RuntimeException: boom
     assert_eq!(created["terminal_exception"], "java.lang.RuntimeException");
     assert_eq!(created["terminal_frame"], "com.example.Foo.bar");
     assert_eq!(created["timestamp"], "2026-08-26T12:00:00.123Z");
+    assert_eq!(created["sample_truncated"], false);
+    assert!(created["first_seen"].as_str().unwrap().ends_with('Z'));
 
     let raw = run_with_fake(
         &fake,
@@ -626,6 +644,91 @@ java.lang.RuntimeException: boom
     );
     assert_eq!(raw_created["terminal_frame"], "com.example.Foo.bar");
     assert_eq!(raw_created["timestamp"], "2026-08-26T12:00:00.123Z");
+}
+
+#[test]
+fn source_ended_stderr_is_always_redacted() {
+    let fake = FakeAio::install();
+    fs::write(
+        &fake.logs,
+        "26.08.2026 12:00:00.123 n *ERROR* [t] com.example.Foo boom\n",
+    )
+    .unwrap();
+    let mut cmd = aemlog();
+    cmd.args([
+        "--program-id",
+        "p1",
+        "--environment-id",
+        "e1",
+        "--service",
+        "author",
+        "--json",
+        "--raw-sample",
+    ])
+    .env_clear()
+    .env("PATH", fake.path())
+    .env("AEMLOG_FAKE_AIO_RECORD", &fake.record)
+    .env("AEMLOG_FAKE_AIO_STDIN_RECORD", &fake.stdin_record)
+    .env("AEMLOG_FAKE_AIO_LOGS", &fake.logs)
+    .env(
+        "AEMLOG_FAKE_AIO_STDERR",
+        "token=supersecret ops@example.com",
+    )
+    .stdin(Stdio::null())
+    .stdout(Stdio::piped())
+    .stderr(Stdio::piped());
+    let output = cmd.output().expect("run aemlog");
+    let recs = json_lines(&output);
+    let ended = recs
+        .iter()
+        .find(|r| r["type"] == "source_ended")
+        .expect("source_ended");
+    let stderr_text = ended["stderr"].as_str().unwrap();
+    assert!(!stderr_text.contains("supersecret"), "{stderr_text}");
+    assert!(!stderr_text.contains("ops@example.com"), "{stderr_text}");
+    assert!(stderr_text.contains("[REDACTED:token]"), "{stderr_text}");
+    assert!(stderr_text.contains("[REDACTED:email]"), "{stderr_text}");
+    assert_eq!(ended["stderr_truncated"], false);
+}
+
+#[test]
+fn broken_stdout_exits_1() {
+    let fake = FakeAio::install();
+    fs::write(
+        &fake.logs,
+        "26.08.2026 12:00:00.123 n *ERROR* [t] com.example.Foo boom\n",
+    )
+    .unwrap();
+    let mut child = aemlog()
+        .args([
+            "--program-id",
+            "p1",
+            "--environment-id",
+            "e1",
+            "--service",
+            "author",
+            "--json",
+        ])
+        .env_clear()
+        .env("PATH", fake.path())
+        .env("AEMLOG_FAKE_AIO_RECORD", &fake.record)
+        .env("AEMLOG_FAKE_AIO_STDIN_RECORD", &fake.stdin_record)
+        .env("AEMLOG_FAKE_AIO_LOGS", &fake.logs)
+        .env("AEMLOG_FAKE_AIO_HOLD", "1")
+        .env("AEMLOG_FAKE_AIO_PID", &fake.pid_file)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn aemlog");
+    drop(child.stdout.take());
+    let output = child.wait_with_output().expect("wait aemlog");
+    assert_eq!(output.status.code(), Some(1), "stderr={}", stderr(&output));
+    if let Ok(pid) = fs::read_to_string(&fake.pid_file) {
+        if let Ok(pid) = pid.trim().parse::<i32>() {
+            assert!(!pid_alive(pid), "aio orphaned after broken stdout");
+        }
+    }
 }
 
 #[test]
@@ -672,6 +775,20 @@ fn parser_diagnostics_redact_unless_raw_sample() {
     let raw_err = stderr(&raw);
     assert!(raw_err.contains("parser diagnostic"), "{raw_err}");
     assert!(raw_err.contains("ops@example.com"), "{raw_err}");
+    let recs = json_lines(&output);
+    let parser = recs
+        .iter()
+        .find(|r| r["type"] == "parser_error")
+        .expect("parser_error");
+    assert_eq!(parser["reason"], "unframed_prefix");
+    assert!(!parser["sample"]
+        .as_str()
+        .unwrap()
+        .contains("ops@example.com"));
+    assert!(parser["sample"]
+        .as_str()
+        .unwrap()
+        .contains("[REDACTED:email]"));
 }
 
 #[test]

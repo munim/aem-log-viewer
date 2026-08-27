@@ -1,0 +1,19 @@
+{
+  "version": 1,
+  "type": "group_merged",
+  "session_id": "550e8400-e29b-41d4-a716-446655440000",
+  "emitted_at": "2026-08-26T12:00:05.000Z",
+  "group_id": 1,
+  "removed_id": 2,
+  "count": 6,
+  "first_seen": "2026-08-26T12:00:00.000Z",
+  "last_seen": "2026-08-26T12:00:05.000Z",
+  "template": "alpha <*> <*> <*> epsilon",
+  "nodes": ["author-0", "author-1", "author-2"],
+  "muted": true,
+  "level": "ERROR",
+  "sample": "26.08.2026 12:00:00.000 author-0 *ERROR* [FelixDispatchQueue] com.example.Foo alpha beta gamma delta epsilon",
+  "sample_truncated": false,
+  "fast_rate": 0.416,
+  "baseline_rate": 0.014
+}

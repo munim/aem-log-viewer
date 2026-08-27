@@ -77,7 +77,6 @@ impl RateState {
         }
     }
 
-    #[allow(dead_code)]
     pub(super) fn rates_at(&self, at: DateTime<Utc>, params: &RateParams) -> (f64, f64) {
         let mut copy = *self;
         copy.decay_to(at.max(copy.updated_at), params);

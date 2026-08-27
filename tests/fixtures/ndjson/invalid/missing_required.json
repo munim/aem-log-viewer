@@ -1,0 +1,12 @@
+{
+  "version": 1,
+  "type": "session_started",
+  "session_id": "550e8400-e29b-41d4-a716-446655440000",
+  "emitted_at": "2026-08-26T12:00:00.123Z",
+  "source": {
+    "program_id": "p1",
+    "environment_id": "e1",
+    "service": "author",
+    "log": "aemerror"
+  }
+}
