@@ -815,10 +815,16 @@ fn run_ui(session: &mut LiveSession, guard: &mut TerminalGuard) -> UiOutcome {
                         session.request_stop();
                         return restore_and_quit(guard);
                     }
-                    guard
+                    if let Err(err) = guard
                         .terminal
                         .draw(|frame| render(frame, &app))
-                        .map_err(io_err)?;
+                        .map_err(io_err)
+                    {
+                        session.request_stop();
+                        session.kill_orphans();
+                        let _ = guard.restore();
+                        return UiOutcome::Failed(err);
+                    }
                     last_draw = Instant::now();
                     dirty = false;
                 }
